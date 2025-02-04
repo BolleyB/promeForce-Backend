@@ -1,0 +1,6 @@
+version: 1.0
+runtime: CUSTOM
+port: "8000"
+instanceConfiguration:
+  cpu: 1024
+  memory: 2048

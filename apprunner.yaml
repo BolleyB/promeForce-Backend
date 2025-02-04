@@ -4,6 +4,3 @@ run:
   command: "uvicorn app:app --host 0.0.0.0 --port 8000"
   network:
     port: "8000"
-instanceConfiguration:
-  cpu: 1024
-  memory: 2048

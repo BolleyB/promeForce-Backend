@@ -1,5 +1,5 @@
 version: 1.0
-runtime: CUSTOM
+runtime: python311
 port: "8000"
 instanceConfiguration:
   cpu: 1024

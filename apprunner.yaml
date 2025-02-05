@@ -1,5 +1,5 @@
 version: 1.0
-runtime: python38
+runtime: python311
 run:
   command: "uvicorn app:app"
   network:

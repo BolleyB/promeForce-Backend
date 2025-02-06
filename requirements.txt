@@ -5,3 +5,11 @@ llama-index
 openai
 requests
 serpapi
+uvicorn
+fastapi
+llama-index
+llama-index-embeddings-openai
+llama-index-vector-stores-astra-db
+llama-index-llms-openai
+llama-index-readers-web
+google-search-results

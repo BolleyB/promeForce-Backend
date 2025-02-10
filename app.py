@@ -166,7 +166,7 @@ async def startup_event():
 class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
-    top_k: int = 5
+    top_k: int = 25
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
@@ -192,7 +192,7 @@ async def handle_query(request: QueryRequest):
         # Process general queries
         query_engine = search_index.as_query_engine(
             similarity_top_k=request.top_k,
-            vector_store_query_mode="default",
+            vector_store_query_mode="sparse",
             response_mode="tree_summarize"
         )
         

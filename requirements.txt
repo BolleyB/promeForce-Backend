@@ -13,3 +13,4 @@ llama-index-vector-stores-astra-db
 llama-index-llms-openai
 llama-index-readers-web
 google-search-results
+langdetect

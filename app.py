@@ -38,14 +38,15 @@ app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
 db_config = AstraDBConfig()
 
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (use specific domains for security)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],  # Explicitly allow OPTIONS
-    allow_headers=["Authorization", "Content-Type", "Accept"],  # Explicitly set allowed headers
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
 )
-
 
 # Initialize Astra DB
 client = DataAPIClient(db_config.token)
@@ -205,43 +206,51 @@ class QueryRequest(BaseModel):
 
 @app.middleware("http")
 async def validate_query(request: Request, call_next):
-    if request.url.path == "/query":
+    if request.url.path == "/query" and request.method == "POST":
         try:
             body = await request.json()
             if len(body.get('query', '')) < 3:
                 return JSONResponse(
                     status_code=400,
-                    content={"error": "Query must be at least 3 characters"}
+                    content={"error": "Query must be at least 3 characters"},
+                    headers={"Access-Control-Allow-Origin": "*"}
                 )
-        except:
+        except Exception as e:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Invalid request format"}
+                content={"error": "Invalid request format"},
+                headers={"Access-Control-Allow-Origin": "*"}
             )
     return await call_next(request)
+
+@app.options("/query")
+async def options_query():
+    return JSONResponse(
+        content={"message": "Preflight request accepted"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Max-Age": "600"
+        }
+    )
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
     try:
-        # Process temporal context
         time_ctx = TemporalProcessor.parse_time_phrases(request.query)
-        
-        # Detect language
         lang = LanguageHandler.detect_language(request.query)
         
-        # Build filters
         filters = {}
         if time_ctx['target_date']:
             filters = {"date": {"$gte": time_ctx['target_date']}}
         
-        # Execute query
         response = await search_index.aquery(
             request.query,
             filters=filters,
             similarity_top_k=request.top_k
         )
         
-        # Format response
         return {
             "response": response.response,
             "metadata": {
@@ -258,7 +267,11 @@ async def handle_query(request: QueryRequest):
         
     except Exception as e:
         print(f"❌ Query error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
 
 @app.get("/health")
 async def health_check():
@@ -271,7 +284,10 @@ async def health_check():
             "last_updated": datetime.now().isoformat()
         }
     except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     import uvicorn

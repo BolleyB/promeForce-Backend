@@ -72,7 +72,7 @@ embed_model = OpenAIEmbedding(
 )
 
 llm = LlamaOpenAI(
-    model="gpt-4",
+    model="gpt-4-turbo",
     api_key=config.openai_key,
     temperature=0.3
 )
@@ -192,7 +192,7 @@ async def handle_query(request: QueryRequest):
         # Process general queries
         query_engine = search_index.as_query_engine(
             similarity_top_k=10,
-            vector_store_query_mode="sparse_hybrid",
+            vector_store_query_mode="bm25",
             response_mode="compact"
         )
         

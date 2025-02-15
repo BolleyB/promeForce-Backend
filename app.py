@@ -72,7 +72,7 @@ embed_model = OpenAIEmbedding(
 )
 
 llm = LlamaOpenAI(
-    model="gpt-4-turbo",
+    model="gpt-4",
     api_key=config.openai_key,
     temperature=0.3
 )

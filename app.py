@@ -15,19 +15,6 @@ from llama_index.vector_stores.astra_db import AstraDBVectorStore
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.readers.web import SimpleWebPageReader
 
-# Try to import PromptTemplate; if not found, define a minimal version
-try:
-    from llama_index.prompts.base import PromptTemplate
-except ModuleNotFoundError:
-    from typing import List
-    class PromptTemplate:
-        def __init__(self, template: str, input_variables: List[str]):
-            self.template = template
-            self.input_variables = input_variables
-
-        def partial_format(self, **kwargs):
-            return self.template.format(**kwargs)
-
 # Load environment variables
 load_dotenv()
 
@@ -85,7 +72,7 @@ embed_model = OpenAIEmbedding(
 )
 
 llm = LlamaOpenAI(
-    model="gpt-4-turbo",
+    model="gpt-3.5-turbo",
     api_key=config.openai_key,
     temperature=0.3
 )
@@ -118,6 +105,8 @@ def verify_collection_config():
     except Exception as e:
         print(f"❌ Collection verification failed: {e}")
         raise
+
+
 
 def create_index_from_existing() -> VectorStoreIndex:
     """Create index from existing vector store"""
@@ -200,23 +189,11 @@ async def handle_query(request: QueryRequest):
             fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
             return await fetch_sports_data(fixtures_url)
 
-        # Define a custom prompt as a PromptTemplate that provides detailed, actionable instructions without temporal context
-        custom_prompt_template = PromptTemplate(
-            template=(
-                "As a sponsorship strategy expert, please answer the following query with clear, actionable insights and recommendations. "
-                "Include practical steps with a timeline, key measurement metrics, risk mitigation strategies, and any relevant supporting data such as market trends, ROI projections, and case studies. "
-                "Ensure your response is detailed, concise, and professional. Always include: 'Explore more at SponsorForce.net'.\n"
-                "Query: {query}"
-            ),
-            input_variables=["query"]
-        )
-
-        # Process general queries using the custom prompt template
+        # Process general queries
         query_engine = search_index.as_query_engine(
             similarity_top_k=10,
             vector_store_query_mode="default",
-            response_mode="compact",
-            text_qa_template=custom_prompt_template
+            response_mode="tree_summarize"
         )
         
         response = await query_engine.aquery(request.query)

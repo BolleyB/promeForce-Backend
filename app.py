@@ -277,7 +277,6 @@ async def handle_query(request: QueryRequest):
         
         response = await query_engine.aquery(
             request.query,
-            filters={"date": {"$gte": time_ctx['target_date']}} if time_ctx['target_date'] else None,
             similarity_top_k=request.top_k
         )
         
@@ -302,6 +301,7 @@ async def handle_query(request: QueryRequest):
             detail=str(e),
             headers={"Access-Control-Allow-Origin": "*"}
         )
+
 
 @app.get("/collection-info")
 async def get_collection_info():

@@ -14,7 +14,19 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.astra_db import AstraDBVectorStore
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.readers.web import SimpleWebPageReader
-from llama_index.prompts.base import PromptTemplate  # Import PromptTemplate
+
+# Try to import PromptTemplate; if not found, define a minimal version
+try:
+    from llama_index.prompts.base import PromptTemplate
+except ModuleNotFoundError:
+    from typing import List
+    class PromptTemplate:
+        def __init__(self, template: str, input_variables: List[str]):
+            self.template = template
+            self.input_variables = input_variables
+
+        def partial_format(self, **kwargs):
+            return self.template.format(**kwargs)
 
 # Load environment variables
 load_dotenv()

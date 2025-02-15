@@ -93,16 +93,16 @@ class TemporalProcessor:
             'next week': current_date + timedelta(weeks=1)
         }
         
-        found_phrases = [
-            phrase for phrase in time_map.keys()
-            if phrase in query.lower()
-        ]
+        found_phrases = [phrase for phrase in time_map.keys() if phrase in query.lower()]
+        temporal_expression = found_phrases[0] if found_phrases else None
+        target_date_value = time_map.get(temporal_expression, current_date)
         
         return {
-            'temporal_expression': found_phrases[0] if found_phrases else None,
+            'temporal_expression': temporal_expression,
             'reference_date': current_date.strftime('%Y-%m-%d'),
-            'target_date': time_map.get(found_phrases[0], current_date).strftime('%Y-%m-%d')
+            'target_date': target_date_value.strftime('%Y-%m-%d')
         }
+
 
 class LanguageHandler:
     @staticmethod

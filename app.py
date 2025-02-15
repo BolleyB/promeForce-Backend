@@ -14,6 +14,7 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.astra_db import AstraDBVectorStore
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.readers.web import SimpleWebPageReader
+from llama_index.prompts.base import PromptTemplate  # Import PromptTemplate
 
 # Load environment variables
 load_dotenv()
@@ -187,20 +188,23 @@ async def handle_query(request: QueryRequest):
             fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
             return await fetch_sports_data(fixtures_url)
 
-        # Define a custom prompt that provides detailed, actionable instructions without temporal context
-        custom_prompt = (
-            "As a sponsorship strategy expert, please answer the following query with clear, actionable insights and recommendations. "
-            "Include practical steps with a timeline, key measurement metrics, risk mitigation strategies, and any relevant supporting data such as market trends, ROI projections, and case studies. "
-            "Ensure your response is detailed, concise, and professional. Always include: 'Explore more at SponsorForce.net'.\n"
-            "Query: {query}"
+        # Define a custom prompt as a PromptTemplate that provides detailed, actionable instructions without temporal context
+        custom_prompt_template = PromptTemplate(
+            template=(
+                "As a sponsorship strategy expert, please answer the following query with clear, actionable insights and recommendations. "
+                "Include practical steps with a timeline, key measurement metrics, risk mitigation strategies, and any relevant supporting data such as market trends, ROI projections, and case studies. "
+                "Ensure your response is detailed, concise, and professional. Always include: 'Explore more at SponsorForce.net'.\n"
+                "Query: {query}"
+            ),
+            input_variables=["query"]
         )
 
-        # Process general queries using the custom prompt
+        # Process general queries using the custom prompt template
         query_engine = search_index.as_query_engine(
             similarity_top_k=10,
             vector_store_query_mode="default",
             response_mode="compact",
-            text_qa_template=custom_prompt
+            text_qa_template=custom_prompt_template
         )
         
         response = await query_engine.aquery(request.query)

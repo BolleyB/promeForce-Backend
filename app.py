@@ -1,15 +1,19 @@
 import os
 import asyncio
+from datetime import datetime, timedelta
 from typing import Dict, Any, List
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import httpx
 from astrapy import DataAPIClient
+from langdetect import detect, LangDetectException
 
 # Llama Index Components
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
+from llama_index.core.postprocessor import TimeWeightedPostprocessor
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.astra_db import AstraDBVectorStore
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
@@ -17,23 +21,6 @@ from llama_index.readers.web import SimpleWebPageReader
 
 # Load environment variables
 load_dotenv()
-
-# ✅ Attempt to Get Available Query Modes
-try:
-    from llama_index.core.query_engine import VectorStoreQueryMode
-    available_modes = list(VectorStoreQueryMode)
-except ImportError:
-    print("⚠️ Unable to import VectorStoreQueryMode. Using default mode.")
-    available_modes = ["default"]  # Fallback to "default" mode if unavailable
-
-# ✅ Auto-Select Best Query Mode
-query_mode = "default"
-if "hybrid" in available_modes:
-    query_mode = "hybrid"
-elif "bm25" in available_modes:
-    query_mode = "bm25"
-print(f"🔍 Available Query Modes: {available_modes}")
-print(f"✅ Using Query Mode: {query_mode}")
 
 class AstraDBConfig(BaseModel):
     endpoint: str = os.getenv("ASTRA_DB_ENDPOINT")
@@ -51,13 +38,14 @@ app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
 db_config = AstraDBConfig()
 
-# ✅ Add CORS Middleware
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # Initialize Astra DB
@@ -67,7 +55,6 @@ db = client.get_database(
     namespace=db_config.namespace
 )
 
-# Initialize Astra DB with enhanced configuration
 try:
     astra_vector_store = AstraDBVectorStore(
         token=db_config.token,
@@ -81,7 +68,7 @@ except Exception as e:
     print(f"❌ Astra DB connection failed: {e}")
     raise
 
-# Initialize AI models
+# AI Models Configuration
 embed_model = OpenAIEmbedding(
     api_key=config.openai_key,
     model_name="text-embedding-3-small"
@@ -93,84 +80,88 @@ llm = LlamaOpenAI(
     temperature=0.3
 )
 
-def build_prompt_template() -> str:
-    """Creates a structured query prompt template"""
-    return """
-    Vector Search Context:
-    Utilize {vector_search} to retrieve precise and contextually relevant information from a well-curated knowledge base.
+class TemporalProcessor:
+    @staticmethod
+    def parse_time_phrases(query: str) -> Dict:
+        current_date = datetime.now()
+        time_map = {
+            'today': current_date,
+            'tomorrow': current_date + timedelta(days=1),
+            'this weekend': current_date + timedelta(
+                days=(5 - current_date.weekday()) % 7  # Next Saturday
+            ),
+            'next week': current_date + timedelta(weeks=1)
+        }
+        
+        found_phrases = [
+            phrase for phrase in time_map.keys()
+            if phrase in query.lower()
+        ]
+        
+        return {
+            'temporal_expression': found_phrases[0] if found_phrases else None,
+            'reference_date': current_date.strftime('%Y-%m-%d'),
+            'target_date': time_map.get(found_phrases[0], current_date).strftime('%Y-%m-%d')
+        }
+
+class LanguageHandler:
+    @staticmethod
+    def detect_language(query: str) -> str:
+        try:
+            return detect(query)
+        except LangDetectException:
+            return 'en'
+
+def build_custom_prompt(lang: str, time_context: dict) -> str:
+    return f"""
+    As a sponsorship strategy expert, respond with:
     
-    Enhanced Vector Graph Database Integration:
-    Leverage {vector_graph_database} to enable advanced semantic querying and retrieval of interconnected data points.
-
-    Google Search Integration:
-    Utilize {google_search} to supplement responses with the latest industry trends and examples.
-
-    Vector Scrape Context:
-    Utilize {vector_scrape} to extract real-world examples, case studies, or data from trusted online sources.
-
-    Time-Aware Functionality:
-    - Recognize and interpret temporal expressions like "today," "tomorrow," or "next week."
-    - Dynamically calculate relevant dates based on the current date.
-
-    Language Matching:
-    - Automatically detect the language of the query.
-    - Always respond in the same language.
-
-    Role and Mission:
-    You are an expert in sponsorship strategies, marketing, and business development. Your mission is to:
-    1. Educate and Inspire
-    2. Use Examples
-    3. Provide Actionable Guidance
-    4. Offer Data-Driven Information
-    5. Maintain a Professional Yet Approachable Tone
-
-    Query Context:
-    - Question: {query}
-    - Temporal Expression Identified: {temporal_expression}
-    - Current Date: {current_date}
-
-    Website Forwarding:
-    - If additional information is available, suggest visiting SponsorForce.net.
+    1. Time Awareness ({time_context['temporal_expression'] or 'N/A'}):
+    - Focus on period between {time_context['reference_date']} and {time_context['target_date']}
+    - Update outdated temporal references in context
+    
+    2. Language Matching:
+    - Respond in {lang}
+    - Use industry terms in {lang}
+    
+    3. Actionable Content:
+    [Implementation Steps]
+    1. Practical first step with timeline
+    2. Measurement metrics
+    3. Risk mitigation
+    
+    [Supporting Data]
+    - Market trends 2023-2024
+    - ROI projections
+    - Case studies from database
+    
+    4. Website Redirection:
+    Always include: "Explore more at SponsorForce.net"
+    
+    Query: {{query}}
     """
 
-def verify_collection_config():
-    """Verify or create collection with vector configuration"""
-    try:
-        collection_names = [c.name for c in db.list_collections()]
-        
-        if db_config.collection not in collection_names:
-            print(f"🆕 Creating collection {db_config.collection}")
-            db.create_collection(
-                name=db_config.collection,
-                options={
-                    "vector": {
-                        "dimension": db_config.embedding_dim,
-                        "metric": "cosine"
-                    }
-                }
-            )
-            print(f"✅ Collection {db_config.collection} created")
-        else:
-            print(f"🔍 Collection {db_config.collection} exists")
-
-        # Verify collection can be accessed
-        collection = db.get_collection(db_config.collection)
-        print(f"✅ Collection verification successful")
-        
-    except Exception as e:
-        print(f"❌ Collection verification failed: {e}")
-        raise
-
-def create_index_from_existing() -> VectorStoreIndex:
-    """Create index from existing vector store"""
+def create_query_engine(lang: str, time_context: dict):
     return VectorStoreIndex.from_vector_store(
-        vector_store=astra_vector_store,
-        embed_model=embed_model,
-        storage_context=StorageContext.from_defaults(vector_store=astra_vector_store)
+        astra_vector_store,
+        embed_model=embed_model
+    ).as_query_engine(
+        similarity_top_k=15,
+        vector_store_query_mode="default",
+        response_mode="compact",
+        node_postprocessors=[
+            TimeWeightedPostprocessor(
+                time_decay=0.7,
+                time_access_refresh=True
+            )
+        ],
+        text_qa_template=build_custom_prompt(lang, time_context)
     )
 
+def validate_document(doc):
+    return len(doc.text) > 100 and 'date' in doc.metadata
+
 async def initialize_documents() -> VectorStoreIndex:
-    """Initialize document sources and create vector index"""
     try:
         web_reader = SimpleWebPageReader()
         local_reader = SimpleDirectoryReader("./data/")
@@ -184,8 +175,13 @@ async def initialize_documents() -> VectorStoreIndex:
             local_reader.load_data_async()
         )
         
-        return VectorStoreIndex(
-            documents=[*web_docs, *local_docs],
+        valid_docs = [
+            doc for doc in [*web_docs, *local_docs]
+            if validate_document(doc)
+        ]
+        
+        return VectorStoreIndex.from_documents(
+            documents=valid_docs,
             storage_context=StorageContext.from_defaults(
                 vector_store=astra_vector_store
             ),
@@ -198,18 +194,19 @@ async def initialize_documents() -> VectorStoreIndex:
 @app.on_event("startup")
 async def startup_event():
     global search_index
-    verify_collection_config()
-    
     try:
         collection = db.get_collection(db_config.collection)
         count = collection.estimated_document_count()
-
+        
         if count == 0:
             print("🆕 Initializing new collection with documents")
             search_index = await initialize_documents()
         else:
-            print(f"🔍 Found existing collection with {count} documents")
-            search_index = create_index_from_existing()
+            print(f"🔍 Found {count} existing documents")
+            search_index = VectorStoreIndex.from_vector_store(
+                astra_vector_store,
+                embed_model=embed_model
+            )
             
     except Exception as e:
         print(f"❌ Startup failed: {e}")
@@ -218,37 +215,156 @@ async def startup_event():
 class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
-    top_k: int = 20
+    top_k: int = 15
+
+@app.middleware("http")
+async def validate_query(request: Request, call_next):
+    if request.url.path == "/query" and request.method == "POST":
+        try:
+            body = await request.json()
+            if len(body.get('query', '')) < 3:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Query must be at least 3 characters"},
+                    headers={"Access-Control-Allow-Origin": "*"}
+                )
+        except:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid request format"},
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+    return await call_next(request)
+
+@app.options("/query")
+async def options_query():
+    return JSONResponse(
+        content={"message": "Preflight request accepted"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Max-Age": "600"
+        }
+    )
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
     try:
-        query_engine = search_index.as_query_engine(
-            similarity_top_k=request.top_k,
-            vector_store_query_mode=query_mode,
-            response_mode="compact",
-            text_qa_template=build_prompt_template()
+        query_lower = request.query.lower()
+        # Handle sports queries
+        if "live scores" in query_lower:
+            url = f"https://www.thesportsdb.com/api/v2/json/{config.sportsdb_key}/livescore/soccer"
+            return await fetch_sports_data(url)
+            
+        if "upcoming fixtures" in query_lower:
+            team_name = query_lower.split("for")[-1].strip()
+            team_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/searchteams.php?t={team_name}"
+            team_data = await fetch_sports_data(team_url)
+            
+            if not team_data.get("teams"):
+                return {"response": f"No team found: {team_name}"}
+                
+            team_id = team_data["teams"][0]["idTeam"]
+            fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
+            return await fetch_sports_data(fixtures_url)
+
+        # Process sponsorship queries
+        time_ctx = TemporalProcessor.parse_time_phrases(request.query)
+        lang = LanguageHandler.detect_language(request.query)
+        
+        query_engine = create_query_engine(lang, time_ctx)
+        
+        response = await query_engine.aquery(
+            request.query,
+            filters={"date": {"$gte": time_ctx['target_date']}} if time_ctx['target_date'] else None,
+            similarity_top_k=request.top_k
         )
         
-        response = await query_engine.aquery(request.query)
         return {
             "response": response.response,
-            "sources": [node.metadata for node in response.source_nodes]
+            "metadata": {
+                "language": lang,
+                "temporal_context": time_ctx,
+                "sources": [
+                    {**node.metadata, "score": node.score}
+                    for node in response.source_nodes
+                ],
+                "confidence": sum(n.score for n in response.source_nodes)/len(response.source_nodes)
+            },
+            "website_redirect": "https://www.sponsorforce.net/#/portal/resource"
         }
         
     except Exception as e:
-        print(f"❌ Query processing error: {e}")
-        raise HTTPException(status_code=500, detail="Query processing failed")
+        print(f"❌ Query error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
 
-@app.get("/query-modes")
-async def get_query_modes():
-    """Get available query modes dynamically"""
-    return {"available_query_modes": available_modes, "selected_mode": query_mode}
+@app.get("/collection-info")
+async def get_collection_info():
+    try:
+        collection = db.get_collection(db_config.collection)
+        count_result = collection.count_documents({})
+        count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
+        sample = collection.find_one({})["data"]["document"]
+        
+        return {
+            "total_documents": count,
+            "sample_document": sample
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class DocumentUpdate(BaseModel):
+    documents: List[Dict]
+
+@app.post("/update-documents")
+async def update_documents(update: DocumentUpdate):
+    try:
+        index = VectorStoreIndex.from_vector_store(
+            astra_vector_store,
+            embed_model=embed_model
+        )
+        index.insert(update.documents)
+        return {"message": f"Added {len(update.documents)} documents"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def fetch_sports_data(url: str) -> Dict:
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            print(f"Sports API error: {e.response.status_code}")
+            return {"error": str(e)}
+
+@app.get("/health")
+async def health_check():
+    try:
+        collection_names = [c.name for c in db.list_collections()]
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "collections": len(collection_names),
+            "collection_names": collection_names
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000
+        port=8000,
+        ssl_keyfile=os.getenv("SSL_KEY_PATH"),
+        ssl_certfile=os.getenv("SSL_CERT_PATH")
     )

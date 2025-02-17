@@ -30,6 +30,15 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 # Load environment variables
 load_dotenv()
 
+# Global Role and Mission Prompt
+ROLE_AND_MISSION_PROMPT = (
+    "You are an expert in sponsorship strategies, marketing, and business development. Your mission is to:\n"
+    "Educate and Inspire: Provide in-depth insights and practical advice that leave the user feeling more informed and confident.\n"
+    "Use Examples: Incorporate real-world examples, industry trends, or case studies where applicable.\n"
+    "Actionable Guidance: Offer step-by-step instructions, best practices, or actionable recommendations the user can implement immediately.\n"
+    "Data-Driven Information: Include data, statistics, or references to establish credibility.\n"
+    "Professional Yet Approachable Tone: Maintain professionalism while ensuring the tone is encouraging and user-friendly.\n"
+)
 
 class AstraDBConfig(BaseModel):
     endpoint: str = os.getenv("ASTRA_DB_ENDPOINT")
@@ -38,12 +47,10 @@ class AstraDBConfig(BaseModel):
     embedding_dim: int = 1536
     namespace: str = os.getenv("ASTRA_DB_KEYSPACE", "default_keyspace")
 
-
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
     serpapi_key: str = os.getenv("SERPAPI_KEY")
     sportsdb_key: str = os.getenv("SPORTSDB_KEY", "392246")
-
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
@@ -91,7 +98,6 @@ llm = LlamaOpenAI(
     temperature=0.3
 )
 
-
 def verify_collection_config():
     """Verify or create collection with vector configuration"""
     try:
@@ -120,7 +126,6 @@ def verify_collection_config():
         print(f"❌ Collection verification failed: {e}")
         raise
 
-
 def create_index_from_existing() -> VectorStoreIndex:
     """Create index from existing vector store"""
     return VectorStoreIndex.from_vector_store(
@@ -128,7 +133,6 @@ def create_index_from_existing() -> VectorStoreIndex:
         embed_model=embed_model,
         storage_context=StorageContext.from_defaults(vector_store=astra_vector_store)
     )
-
 
 async def initialize_documents() -> VectorStoreIndex:
     """Initialize document sources and create vector index"""
@@ -156,7 +160,6 @@ async def initialize_documents() -> VectorStoreIndex:
         print(f"❌ Document initialization failed: {e}")
         raise
 
-
 @app.on_event("startup")
 async def startup_event():
     global search_index
@@ -182,11 +185,10 @@ async def startup_event():
         print(f"❌ Startup failed: {e}")
         raise
 
-
 # Custom Query Engine Creation Function
 def create_custom_query_engine(
     index: VectorStoreIndex,
-    similarity_top_k: int = 5,
+    similarity_top_k: int = 15,
     response_mode: str = "tree_summarize"
 ) -> RetrieverQueryEngine:
     retriever = VectorIndexRetriever(
@@ -202,12 +204,10 @@ def create_custom_query_engine(
     )
     return query_engine
 
-
 class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
-    top_k: int = 5
-
+    top_k: int = 15
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
@@ -230,6 +230,9 @@ async def handle_query(request: QueryRequest):
             fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
             return await fetch_sports_data(fixtures_url)
 
+        # Prepend the Role and Mission prompt to the user's query
+        final_query = ROLE_AND_MISSION_PROMPT + "\n\n" + request.query
+        
         # Use custom query engine for general queries
         query_engine = create_custom_query_engine(
             index=search_index,
@@ -238,7 +241,7 @@ async def handle_query(request: QueryRequest):
         )
         
         # Use asynchronous query if supported
-        response = await query_engine.aquery(request.query)
+        response = await query_engine.aquery(final_query)
         return {
             "response": response.response,
             "sources": [node.metadata for node in response.source_nodes]
@@ -248,14 +251,13 @@ async def handle_query(request: QueryRequest):
         print(f"❌ Query processing error: {e}")
         raise HTTPException(status_code=500, detail="Query processing failed")
 
-
 @app.get("/collection-info")
 async def get_collection_info():
     """Validate collection contents"""
     try:
         collection = db.get_collection(db_config.collection)
         try:
-            count = collection.count_documents({}, upper_bound=1000000)
+            count = collection.count_documents({}, upper_bound=500)
         except TooManyDocumentsToCountException:
             count = "More than 1000"
         sample = collection.find_one({})["data"]["document"]
@@ -267,10 +269,8 @@ async def get_collection_info():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 class DocumentUpdate(BaseModel):
     documents: List[Dict]
-
 
 @app.post("/update-documents")
 async def update_documents(update: DocumentUpdate):
@@ -282,7 +282,6 @@ async def update_documents(update: DocumentUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 async def fetch_sports_data(url: str) -> Dict:
     """Generic sports data fetcher"""
     async with httpx.AsyncClient() as client:
@@ -293,7 +292,6 @@ async def fetch_sports_data(url: str) -> Dict:
         except httpx.HTTPStatusError as e:
             print(f"Sports API error: {e.response.status_code}")
             return {"error": str(e)}
-
 
 @app.get("/health")
 async def health_check():
@@ -310,7 +308,6 @@ async def health_check():
             "status": "unhealthy",
             "error": str(e)
         }
-
 
 if __name__ == "__main__":
     import uvicorn

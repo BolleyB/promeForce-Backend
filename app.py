@@ -18,6 +18,7 @@ from llama_index.readers.web import SimpleWebPageReader
 # Load environment variables
 load_dotenv()
 
+
 class AstraDBConfig(BaseModel):
     endpoint: str = os.getenv("ASTRA_DB_ENDPOINT")
     token: str = os.getenv("ASTRA_DB_TOKEN")
@@ -33,6 +34,15 @@ class APIConfig(BaseModel):
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
 db_config = AstraDBConfig()
+
+# ✅ Add CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all domains (change this for security)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Initialize Astra DB with DataAPIClient
 client = DataAPIClient(db_config.token)
@@ -182,7 +192,7 @@ async def handle_query(request: QueryRequest):
         # Process general queries
         query_engine = search_index.as_query_engine(
             similarity_top_k=request.top_k,
-            vector_store_query_mode="hybrid",
+            vector_store_query_mode="default",
             response_mode="tree_summarize"
         )
         

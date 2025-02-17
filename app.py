@@ -176,10 +176,10 @@ async def startup_event():
 
 # Helper function to handle sports queries using SearchAPI
 async def handle_sports_query(query: str) -> Dict:
-    # Build the SearchAPI URL
+    # Build the SearchAPI URL using the endpoint /api/v1/search?engine=google
     search_url = (
-        "https://api.searchapi.net/api/search"
-        f"?query={query}"
+        "https://api.searchapi.net/api/v1/search?engine=google"
+        f"&query={query}"
         f"&api_key={config.searchapi_key}"
     )
     async with httpx.AsyncClient() as client:

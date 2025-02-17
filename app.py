@@ -8,7 +8,7 @@ from pydantic import BaseModel, HttpUrl
 import httpx
 from astrapy import DataAPIClient
 
-# Import exception for document count limits
+# Import exception for document count limits (if needed in other contexts)
 from astrapy.exceptions import TooManyDocumentsToCountException
 
 # Llama Index & Database Components
@@ -167,13 +167,10 @@ async def startup_event():
     
     try:
         collection = db.get_collection(db_config.collection)
-        try:
-            # Use count_documents with upper_bound parameter
-            count = collection.count_documents({}, upper_bound=500)
-        except TooManyDocumentsToCountException:
-            # Fallback: assume the collection is non-empty if the count exceeds the limit
-            count = 1001
-
+        # Dynamically get the document count using estimated_document_count()
+        count_result = collection.estimated_document_count()
+        count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
+        
         if count == 0:
             print("🆕 Initializing new collection with documents")
             search_index = await initialize_documents()
@@ -188,7 +185,7 @@ async def startup_event():
 # Custom Query Engine Creation Function
 def create_custom_query_engine(
     index: VectorStoreIndex,
-    similarity_top_k: int = 15,
+    similarity_top_k: int = 50,
     response_mode: str = "tree_summarize"
 ) -> RetrieverQueryEngine:
     retriever = VectorIndexRetriever(
@@ -207,7 +204,7 @@ def create_custom_query_engine(
 class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
-    top_k: int = 15
+    top_k: int = 5
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
@@ -256,10 +253,9 @@ async def get_collection_info():
     """Validate collection contents"""
     try:
         collection = db.get_collection(db_config.collection)
-        try:
-            count = collection.count_documents({}, upper_bound=500)
-        except TooManyDocumentsToCountException:
-            count = "More than 1000"
+        # Dynamically get the document count using estimated_document_count()
+        count_result = collection.estimated_document_count()
+        count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
         sample = collection.find_one({})["data"]["document"]
         
         return {

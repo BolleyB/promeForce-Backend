@@ -187,6 +187,28 @@ async def startup_event():
         print(f"❌ Startup failed: {e}")
         raise
 
+# Helper function to handle sports queries
+async def handle_sports_query(query: str) -> Dict:
+    query_lower = query.lower()
+    if "live scores" in query_lower:
+        url = f"https://www.thesportsdb.com/api/v2/json/{config.sportsdb_key}/livescore/soccer"
+        return await fetch_sports_data(url)
+    elif "upcoming fixtures" in query_lower:
+        team_name = query_lower.split("for")[-1].strip()
+        team_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/searchteams.php?t={team_name}"
+        team_data = await fetch_sports_data(team_url)
+        if not team_data.get("teams"):
+            return {"response": f"No team found: {team_name}"}
+        team_id = team_data["teams"][0]["idTeam"]
+        fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
+        return await fetch_sports_data(fixtures_url)
+    elif any(keyword in query_lower for keyword in ["match", "score", "result"]):
+        # For generic sports queries, default to live scores (or add additional endpoints as needed)
+        url = f"https://www.thesportsdb.com/api/v2/json/{config.sportsdb_key}/livescore/soccer"
+        return await fetch_sports_data(url)
+    else:
+        return {}
+
 # Custom Query Engine Creation Function
 def create_custom_query_engine(
     index: VectorStoreIndex,
@@ -214,35 +236,23 @@ class QueryRequest(BaseModel):
 @app.post("/query")
 async def handle_query(request: QueryRequest):
     try:
-        # Handle sports-related queries first
         query_lower = request.query.lower()
-        if "live scores" in query_lower:
-            url = f"https://www.thesportsdb.com/api/v2/json/{config.sportsdb_key}/livescore/soccer"
-            return await fetch_sports_data(url)
-            
-        if "upcoming fixtures" in query_lower:
-            team_name = query_lower.split("for")[-1].strip()
-            team_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/searchteams.php?t={team_name}"
-            team_data = await fetch_sports_data(team_url)
-            
-            if not team_data.get("teams"):
-                return {"response": f"No team found: {team_name}"}
-                
-            team_id = team_data["teams"][0]["idTeam"]
-            fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
-            return await fetch_sports_data(fixtures_url)
+        # Check for sports keywords
+        if any(keyword in query_lower for keyword in ["live scores", "upcoming fixtures", "match", "score", "result"]):
+            sports_response = await handle_sports_query(request.query)
+            if sports_response:
+                return sports_response
 
-        # Prepend the Role and Mission prompt to the user's query
+        # Prepend the Role and Mission prompt to the user's query for general queries
         final_query = ROLE_AND_MISSION_PROMPT + "\n\n" + request.query
         
         # Use custom query engine for general queries
         query_engine = create_custom_query_engine(
             index=search_index,
-            similarity_top_k=request.top_k,       # You can experiment with this value
-            response_mode="tree_summarize"          # Other options: "compact", "refine", etc.
+            similarity_top_k=request.top_k,  # You can experiment with this value
+            response_mode="tree_summarize"     # Other options: "compact", "refine", etc.
         )
         
-        # Use asynchronous query if supported
         response = await query_engine.aquery(final_query)
         return {
             "response": response.response,

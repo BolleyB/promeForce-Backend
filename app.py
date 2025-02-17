@@ -177,9 +177,10 @@ async def startup_event():
 # Helper function to handle sports queries using SearchAPI
 async def handle_sports_query(query: str) -> Dict:
     # Build the SearchAPI URL using the endpoint /api/v1/search?engine=google
+    # According to the YAML, the base URL is: https://www.searchapi.io/api/v1/search?engine=google
     search_url = (
-        "https://api.searchapi.net/api/v1/search?engine=google"
-        f"&query={query}"
+        "https://www.searchapi.io/api/v1/search?engine=google"
+        f"&q={query}"
         f"&api_key={config.searchapi_key}"
     )
     async with httpx.AsyncClient() as client:
@@ -187,13 +188,13 @@ async def handle_sports_query(query: str) -> Dict:
             response = await client.get(search_url)
             response.raise_for_status()
             search_results = response.json()
-            items = search_results.get("results", [])
+            items = search_results.get("organic_results", [])  # Adjust key as needed based on API response
             results = []
             for item in items[:5]:
                 results.append({
                     "title": item.get("title"),
-                    "snippet": item.get("description") or item.get("snippet"),
-                    "link": item.get("url")
+                    "snippet": item.get("snippet") or item.get("description"),
+                    "link": item.get("link")
                 })
             return {"response": results}
         except httpx.HTTPStatusError as e:

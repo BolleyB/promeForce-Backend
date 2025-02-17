@@ -8,12 +8,24 @@ from pydantic import BaseModel, HttpUrl
 import httpx
 from astrapy import DataAPIClient
 
+# Import exception for document count limits
+from astrapy.exceptions import TooManyDocumentsToCountException
+
 # Llama Index & Database Components
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    StorageContext,
+)
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.astra_db import AstraDBVectorStore
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.readers.web import SimpleWebPageReader
+
+# Additional components for custom query engine
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core import get_response_synthesizer
+from llama_index.core.query_engine import RetrieverQueryEngine
 
 # Load environment variables
 load_dotenv()
@@ -26,10 +38,12 @@ class AstraDBConfig(BaseModel):
     embedding_dim: int = 1536
     namespace: str = os.getenv("ASTRA_DB_KEYSPACE", "default_keyspace")
 
+
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
     serpapi_key: str = os.getenv("SERPAPI_KEY")
     sportsdb_key: str = os.getenv("SPORTSDB_KEY", "392246")
+
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
@@ -51,14 +65,14 @@ db = client.get_database(
     namespace=db_config.namespace
 )
 
-# Initialize Astra DB with enhanced configuration
+# Initialize Astra DB vector store with enhanced configuration
 try:
     astra_vector_store = AstraDBVectorStore(
         token=db_config.token,
         api_endpoint=db_config.endpoint,
         collection_name=db_config.collection,
         embedding_dimension=db_config.embedding_dim,
-        namespace=db_config.namespace
+        namespace=db_config.namespace,
     )
     print("✅ Astra DB connection established")
 except Exception as e:
@@ -77,12 +91,12 @@ llm = LlamaOpenAI(
     temperature=0.3
 )
 
+
 def verify_collection_config():
     """Verify or create collection with vector configuration"""
     try:
         # Check if collection exists
         collection_names = [c.name for c in db.list_collections()]
-        
         if db_config.collection not in collection_names:
             print(f"🆕 Creating collection {db_config.collection}")
             db.create_collection(
@@ -100,12 +114,11 @@ def verify_collection_config():
 
         # Verify collection can be accessed
         collection = db.get_collection(db_config.collection)
-        print(f"✅ Collection verification successful")
+        print("✅ Collection verification successful")
         
     except Exception as e:
         print(f"❌ Collection verification failed: {e}")
         raise
-
 
 
 def create_index_from_existing() -> VectorStoreIndex:
@@ -115,6 +128,7 @@ def create_index_from_existing() -> VectorStoreIndex:
         embed_model=embed_model,
         storage_context=StorageContext.from_defaults(vector_store=astra_vector_store)
     )
+
 
 async def initialize_documents() -> VectorStoreIndex:
     """Initialize document sources and create vector index"""
@@ -142,6 +156,7 @@ async def initialize_documents() -> VectorStoreIndex:
         print(f"❌ Document initialization failed: {e}")
         raise
 
+
 @app.on_event("startup")
 async def startup_event():
     global search_index
@@ -149,9 +164,13 @@ async def startup_event():
     
     try:
         collection = db.get_collection(db_config.collection)
-        count_result = collection.estimated_document_count()
-        count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
-        
+        try:
+            # Use count_documents with upper_bound parameter
+            count = collection.count_documents({}, upper_bound=500)
+        except TooManyDocumentsToCountException:
+            # Fallback: assume the collection is non-empty if the count exceeds the limit
+            count = 1001
+
         if count == 0:
             print("🆕 Initializing new collection with documents")
             search_index = await initialize_documents()
@@ -163,10 +182,32 @@ async def startup_event():
         print(f"❌ Startup failed: {e}")
         raise
 
+
+# Custom Query Engine Creation Function
+def create_custom_query_engine(
+    index: VectorStoreIndex,
+    similarity_top_k: int = 5,
+    response_mode: str = "tree_summarize"
+) -> RetrieverQueryEngine:
+    retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=similarity_top_k,
+    )
+    response_synthesizer = get_response_synthesizer(
+        response_mode=response_mode,
+    )
+    query_engine = RetrieverQueryEngine(
+        retriever=retriever,
+        response_synthesizer=response_synthesizer,
+    )
+    return query_engine
+
+
 class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
     top_k: int = 5
+
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
@@ -189,13 +230,14 @@ async def handle_query(request: QueryRequest):
             fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
             return await fetch_sports_data(fixtures_url)
 
-        # Process general queries
-        query_engine = search_index.as_query_engine(
-            similarity_top_k=request.top_k,
-            vector_store_query_mode="default",
-            response_mode="tree_summarize"
+        # Use custom query engine for general queries
+        query_engine = create_custom_query_engine(
+            index=search_index,
+            similarity_top_k=request.top_k,       # You can experiment with this value
+            response_mode="tree_summarize"          # Other options: "compact", "refine", etc.
         )
         
+        # Use asynchronous query if supported
         response = await query_engine.aquery(request.query)
         return {
             "response": response.response,
@@ -206,13 +248,16 @@ async def handle_query(request: QueryRequest):
         print(f"❌ Query processing error: {e}")
         raise HTTPException(status_code=500, detail="Query processing failed")
 
+
 @app.get("/collection-info")
 async def get_collection_info():
     """Validate collection contents"""
     try:
         collection = db.get_collection(db_config.collection)
-        count_result = collection.count_documents({})
-        count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
+        try:
+            count = collection.count_documents({}, upper_bound=1000000)
+        except TooManyDocumentsToCountException:
+            count = "More than 1000"
         sample = collection.find_one({})["data"]["document"]
         
         return {
@@ -222,8 +267,10 @@ async def get_collection_info():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 class DocumentUpdate(BaseModel):
     documents: List[Dict]
+
 
 @app.post("/update-documents")
 async def update_documents(update: DocumentUpdate):
@@ -235,6 +282,7 @@ async def update_documents(update: DocumentUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 async def fetch_sports_data(url: str) -> Dict:
     """Generic sports data fetcher"""
     async with httpx.AsyncClient() as client:
@@ -245,6 +293,7 @@ async def fetch_sports_data(url: str) -> Dict:
         except httpx.HTTPStatusError as e:
             print(f"Sports API error: {e.response.status_code}")
             return {"error": str(e)}
+
 
 @app.get("/health")
 async def health_check():
@@ -261,6 +310,7 @@ async def health_check():
             "status": "unhealthy",
             "error": str(e)
         }
+
 
 if __name__ == "__main__":
     import uvicorn

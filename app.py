@@ -54,8 +54,7 @@ class AstraDBConfig(BaseModel):
 
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
-    serpapi_key: str = os.getenv("SERPAPI_KEY")
-    sportsdb_key: str = os.getenv("SPORTSDB_KEY", "392246")
+    searchapi_key: str = os.getenv("SEARCHAPI_KEY")  # Using SearchAPI for sports queries
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
@@ -64,10 +63,10 @@ db_config = AstraDBConfig()
 # ✅ Add CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all domains (change this for security)
+    allow_origins=["*"],  
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Initialize Astra DB with DataAPIClient
@@ -106,7 +105,6 @@ llm = LlamaOpenAI(
 def verify_collection_config():
     """Verify or create collection with vector configuration"""
     try:
-        # Check if collection exists
         collection_names = [c.name for c in db.list_collections()]
         if db_config.collection not in collection_names:
             print(f"🆕 Creating collection {db_config.collection}")
@@ -122,11 +120,8 @@ def verify_collection_config():
             print(f"✅ Collection {db_config.collection} created")
         else:
             print(f"🔍 Collection {db_config.collection} exists")
-
-        # Verify collection can be accessed
         collection = db.get_collection(db_config.collection)
         print("✅ Collection verification successful")
-        
     except Exception as e:
         print(f"❌ Collection verification failed: {e}")
         raise
@@ -144,7 +139,6 @@ async def initialize_documents() -> VectorStoreIndex:
     try:
         web_reader = SimpleWebPageReader()
         local_reader = SimpleDirectoryReader("./data/")
-        
         web_docs, local_docs = await asyncio.gather(
             web_reader.load_data_async([
                 "https://www.sponsorforce.net/#/portal/home",
@@ -153,12 +147,9 @@ async def initialize_documents() -> VectorStoreIndex:
             ]),
             local_reader.load_data_async()
         )
-        
         return VectorStoreIndex(
             documents=[*web_docs, *local_docs],
-            storage_context=StorageContext.from_defaults(
-                vector_store=astra_vector_store
-            ),
+            storage_context=StorageContext.from_defaults(vector_store=astra_vector_store),
             embed_model=embed_model
         )
     except Exception as e:
@@ -169,45 +160,45 @@ async def initialize_documents() -> VectorStoreIndex:
 async def startup_event():
     global search_index
     verify_collection_config()
-    
     try:
         collection = db.get_collection(db_config.collection)
-        # Dynamically get the document count using estimated_document_count()
         count_result = collection.estimated_document_count()
         count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
-        
         if count == 0:
             print("🆕 Initializing new collection with documents")
             search_index = await initialize_documents()
         else:
             print(f"🔍 Found existing collection with {count} documents")
             search_index = create_index_from_existing()
-            
     except Exception as e:
         print(f"❌ Startup failed: {e}")
         raise
 
-# Helper function to handle sports queries
+# Helper function to handle sports queries using SearchAPI
 async def handle_sports_query(query: str) -> Dict:
-    query_lower = query.lower()
-    if "live scores" in query_lower:
-        url = f"https://www.thesportsdb.com/api/v2/json/{config.sportsdb_key}/livescore/soccer"
-        return await fetch_sports_data(url)
-    elif "upcoming fixtures" in query_lower:
-        team_name = query_lower.split("for")[-1].strip()
-        team_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/searchteams.php?t={team_name}"
-        team_data = await fetch_sports_data(team_url)
-        if not team_data.get("teams"):
-            return {"response": f"No team found: {team_name}"}
-        team_id = team_data["teams"][0]["idTeam"]
-        fixtures_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}/eventsnext.php?id={team_id}"
-        return await fetch_sports_data(fixtures_url)
-    elif any(keyword in query_lower for keyword in ["match", "score", "result"]):
-        # For generic sports queries, default to live scores (or add additional endpoints as needed)
-        url = f"https://www.thesportsdb.com/api/v2/json/{config.sportsdb_key}/livescore/soccer"
-        return await fetch_sports_data(url)
-    else:
-        return {}
+    # Build the SearchAPI URL
+    search_url = (
+        "https://api.searchapi.net/api/search"
+        f"?query={query}"
+        f"&api_key={config.searchapi_key}"
+    )
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(search_url)
+            response.raise_for_status()
+            search_results = response.json()
+            items = search_results.get("results", [])
+            results = []
+            for item in items[:5]:
+                results.append({
+                    "title": item.get("title"),
+                    "snippet": item.get("description") or item.get("snippet"),
+                    "link": item.get("url")
+                })
+            return {"response": results}
+        except httpx.HTTPStatusError as e:
+            print(f"SearchAPI error: {e.response.status_code}")
+            return {"error": str(e)}
 
 # Custom Query Engine Creation Function
 def create_custom_query_engine(
@@ -219,9 +210,7 @@ def create_custom_query_engine(
         index=index,
         similarity_top_k=similarity_top_k,
     )
-    response_synthesizer = get_response_synthesizer(
-        response_mode=response_mode,
-    )
+    response_synthesizer = get_response_synthesizer(response_mode=response_mode)
     query_engine = RetrieverQueryEngine(
         retriever=retriever,
         response_synthesizer=response_synthesizer,
@@ -237,42 +226,34 @@ class QueryRequest(BaseModel):
 async def handle_query(request: QueryRequest):
     try:
         query_lower = request.query.lower()
-        # Check for sports keywords
-        if any(keyword in query_lower for keyword in ["live scores", "upcoming fixtures", "match", "score", "result"]):
+        # Check for sports-related keywords
+        if any(keyword in query_lower for keyword in ["live scores", "fixture", "match", "score", "result"]):
             sports_response = await handle_sports_query(request.query)
             if sports_response:
                 return sports_response
-
         # Prepend the Role and Mission prompt to the user's query for general queries
         final_query = ROLE_AND_MISSION_PROMPT + "\n\n" + request.query
-        
-        # Use custom query engine for general queries
         query_engine = create_custom_query_engine(
             index=search_index,
-            similarity_top_k=request.top_k,  # You can experiment with this value
-            response_mode="tree_summarize"     # Other options: "compact", "refine", etc.
+            similarity_top_k=request.top_k,
+            response_mode="tree_summarize"
         )
-        
         response = await query_engine.aquery(final_query)
         return {
             "response": response.response,
             "sources": [node.metadata for node in response.source_nodes]
         }
-        
     except Exception as e:
         print(f"❌ Query processing error: {e}")
         raise HTTPException(status_code=500, detail="Query processing failed")
 
 @app.get("/collection-info")
 async def get_collection_info():
-    """Validate collection contents"""
     try:
         collection = db.get_collection(db_config.collection)
-        # Dynamically get the document count using estimated_document_count()
         count_result = collection.estimated_document_count()
         count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
         sample = collection.find_one({})["data"]["document"]
-        
         return {
             "total_documents": count,
             "sample_document": sample
@@ -285,7 +266,6 @@ class DocumentUpdate(BaseModel):
 
 @app.post("/update-documents")
 async def update_documents(update: DocumentUpdate):
-    """Handle incremental document updates"""
     try:
         index = create_index_from_existing()
         index.insert(update.documents)
@@ -294,7 +274,6 @@ async def update_documents(update: DocumentUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 async def fetch_sports_data(url: str) -> Dict:
-    """Generic sports data fetcher"""
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url)
@@ -315,10 +294,7 @@ async def health_check():
             "collection_names": collection_names
         }
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e)
-        }
+        return {"status": "unhealthy", "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn

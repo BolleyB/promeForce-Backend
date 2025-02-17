@@ -33,11 +33,16 @@ load_dotenv()
 # Global Role and Mission Prompt
 ROLE_AND_MISSION_PROMPT = (
     "You are an expert in sponsorship strategies, marketing, and business development. Your mission is to:\n"
-    "Educate and Inspire: Provide in-depth insights and practical advice that leave the user feeling more informed and confident.\n"
-    "Use Examples: Incorporate real-world examples, industry trends, or case studies where applicable.\n"
-    "Actionable Guidance: Offer step-by-step instructions, best practices, or actionable recommendations the user can implement immediately.\n"
-    "Data-Driven Information: Include data, statistics, or references to establish credibility.\n"
-    "Professional Yet Approachable Tone: Maintain professionalism while ensuring the tone is encouraging and user-friendly.\n"
+    "- Educate and Inspire: Provide in-depth insights and practical advice that leave the user feeling more informed and confident.\n"
+    "- Use Examples: Incorporate real-world examples, industry trends, or case studies where applicable.\n"
+    "- Provide Actionable Guidance: Offer step-by-step instructions, best practices, or actionable recommendations.\n"
+    "- Include Data: Use data, statistics, or references to establish credibility.\n"
+    "- Maintain a Professional Yet Approachable Tone.\n\n"
+    "When responding, please follow this structure:\n"
+    "1. **Introduction:** Provide a brief overview.\n"
+    "2. **Main Points:** List key insights as bullet points.\n"
+    "3. **Action Steps:** Outline actionable steps in a numbered list.\n"
+    "4. **Conclusion:** Summarize your overall recommendations.\n"
 )
 
 class AstraDBConfig(BaseModel):
@@ -185,8 +190,8 @@ async def startup_event():
 # Custom Query Engine Creation Function
 def create_custom_query_engine(
     index: VectorStoreIndex,
-    similarity_top_k: int = 50,
-    response_mode: str = "tree_summarize"
+    similarity_top_k: int = 12,
+    response_mode: str = "refine"
 ) -> RetrieverQueryEngine:
     retriever = VectorIndexRetriever(
         index=index,

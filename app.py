@@ -3,9 +3,8 @@ import asyncio
 import logging
 import time
 from typing import Dict, Any, List
-import redis.asyncio as redis
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Form, UploadFile, File, WebSocket
+from fastapi import FastAPI, HTTPException, Header, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -22,6 +21,14 @@ from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core import get_response_synthesizer
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.multi_modal_llms.openai import OpenAIMultiModal
+from starlette.requests import Request
+
+# Try importing redis.asyncio, with fallback if not available
+try:
+    import redis.asyncio as redis
+except ImportError:
+    logging.warning("Redis not installed; caching disabled.")
+    redis = None
 
 # Load environment variables
 load_dotenv()
@@ -29,8 +36,20 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Redis setup
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+# Redis setup with fallback
+redis_client = None
+if redis:
+    try:
+        redis_client = redis.Redis(
+            host=os.getenv("REDISHOST", "localhost"),
+            port=int(os.getenv("REDISPORT", "6379")),
+            username=os.getenv("REDISUSER", ""),
+            password=os.getenv("REDISPASSWORD", ""),
+            decode_responses=True
+        )
+    except Exception as e:
+        logging.error(f"Failed to connect to Redis: {e}")
+        redis_client = None
 
 # Global Role and Mission Prompt
 ROLE_AND_MISSION_PROMPT = """
@@ -65,7 +84,7 @@ class AstraDBConfig(BaseModel):
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
     searchapi_key: str = os.getenv("SEARCHAPI_KEY")
-    newsapi_key: str = os.getenv("NEWSAPI_KEY")  # Add your NewsAPI key to .env
+    newsapi_key: str = os.getenv("NEWSAPI_KEY")
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
@@ -241,53 +260,55 @@ class QueryRequest(BaseModel):
     filters: Dict[str, Any] = None
     top_k: int = 5
     deep_search: bool = False
-    session_id: str = None  # Added for conversational memory
+    session_id: str = None
 
 @app.post("/query")
 @limiter.limit("10/minute")
-async def handle_query(request: QueryRequest, user_id: str = Header(default=None)):
+async def handle_query(request: Request, query_request: QueryRequest, user_id: str = Header(default=None)):
     try:
-        cache_key = f"query:{request.query}:{request.top_k}:{request.deep_search}:{request.session_id}"
-        cached_response = await redis_client.get(cache_key)
+        cache_key = f"query:{query_request.query}:{query_request.top_k}:{query_request.deep_search}:{query_request.session_id}"
+        cached_response = await redis_client.get(cache_key) if redis_client else None
         if cached_response:
             return {"response": cached_response, "sources": []}
 
-        query_lower = request.query.lower()
+        query_lower = query_request.query.lower()
         if any(keyword in query_lower for keyword in ["live scores", "fixture", "match", "score", "result"]):
-            sports_response = await handle_sports_query(request.query)
+            sports_response = await handle_sports_query(query_request.query)
             if sports_response:
-                await redis_client.setex(cache_key, 3600, str(sports_response["response"]))
+                if redis_client:
+                    await redis_client.setex(cache_key, 3600, str(sports_response["response"]))
                 return sports_response
 
-        # Conversational memory
         context = ""
-        if request.session_id:
+        if query_request.session_id:
             session_collection = db.get_collection("sessions")
-            past_queries = await session_collection.find({"session_id": request.session_id}).to_list(length=5)
+            past_queries = await session_collection.find({"session_id": query_request.session_id}).to_list(length=5)
             context = "Previous queries:\n" + "\n".join(q["query"] for q in past_queries) + "\n\n"
-            await session_collection.insert_one({"session_id": request.session_id, "query": request.query, "timestamp": int(time.time())})
+            await session_collection.insert_one({"session_id": query_request.session_id, "query": query_request.query, "timestamp": int(time.time())})
 
-        final_query = f"{context}{ROLE_AND_MISSION_PROMPT}\n\n{request.query}"
-        response_mode = detect_intent(request.query)
+        final_query = f"{context}{ROLE_AND_MISSION_PROMPT}\n\n{query_request.query}"
+        response_mode = detect_intent(query_request.query)
         
-        if request.deep_search:
-            deep_task = perform_deep_search(request.query)
-            query_engine = create_custom_query_engine(index=search_index, similarity_top_k=request.top_k, response_mode=response_mode)
+        if query_request.deep_search:
+            deep_task = perform_deep_search(query_request.query)
+            query_engine = create_custom_query_engine(index=search_index, similarity_top_k=query_request.top_k, response_mode=response_mode)
             vector_task = query_engine.aquery(final_query)
             deep_response, vector_response = await asyncio.gather(deep_task, vector_task)
             if "error" not in deep_response:
                 deep_response["response"] += f"\n\n### Additional Insights from Internal Data\n{vector_response.response}"
                 deep_response["sources"].extend([node.metadata for node in vector_response.source_nodes])
-            await redis_client.setex(cache_key, 3600, deep_response["response"])
+            if redis_client:
+                await redis_client.setex(cache_key, 3600, deep_response["response"])
             return deep_response
         else:
-            query_engine = create_custom_query_engine(index=search_index, similarity_top_k=request.top_k, response_mode=response_mode)
+            query_engine = create_custom_query_engine(index=search_index, similarity_top_k=query_request.top_k, response_mode=response_mode)
             response = await query_engine.aquery(final_query)
             formatted_response = {
                 "response": f"## Response\n\n{response.response}",
                 "sources": [node.metadata for node in response.source_nodes]
             }
-            await redis_client.setex(cache_key, 3600, formatted_response["response"])
+            if redis_client:
+                await redis_client.setex(cache_key, 3600, formatted_response["response"])
             return formatted_response
     except Exception as e:
         logging.error(f"Query processing error: {e}")
@@ -317,7 +338,8 @@ async def update_documents(update: DocumentUpdate):
             astra_vector_store.add([embedding], documents=[text], metadatas=[metadata])
         global search_index
         search_index = create_index_from_existing()
-        await redis_client.flushdb()  # Clear cache on update
+        if redis_client:
+            await redis_client.flushdb()  # Clear cache on update
         return {"message": f"Added {len(update.documents)} documents and updated the index"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -31,19 +31,29 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 load_dotenv()
 
 # Global Role and Mission Prompt
-ROLE_AND_MISSION_PROMPT = (
-    "You are an expert in sponsorship strategies, marketing, and business development. Your mission is to:\n"
-    "- Educate and Inspire: Provide in-depth insights and practical advice that leave the user feeling more informed and confident.\n"
-    "- Use Examples: Incorporate real-world examples, industry trends, or case studies where applicable.\n"
-    "- Provide Actionable Guidance: Offer step-by-step instructions, best practices, or actionable recommendations.\n"
-    "- Include Data: Use data, statistics, or references to establish credibility.\n"
-    "- Maintain a Professional Yet Approachable Tone.\n\n"
-    "When responding, please follow this structure:\n"
-    "1. **Introduction:** Provide a brief overview.\n"
-    "2. **Main Points:** List key insights as bullet points.\n"
-    "3. **Action Steps:** Outline actionable steps in a numbered list.\n"
-    "4. **Conclusion:** Summarize your overall recommendations.\n"
-)
+ROLE_AND_MISSION_PROMPT = """
+You are an expert in sponsorship strategies, marketing, and business development. Your role is to provide high-quality, informative responses that help users understand and navigate these fields effectively.
+
+When crafting your response, consider the following guidelines:
+
+1. **Educate and Inspire:** Offer in-depth insights and practical advice that leave the user feeling more informed and confident.
+
+2. **Use Examples:** Incorporate real-world examples, industry trends, or case studies to make the information more relatable and engaging.
+
+3. **Provide Actionable Guidance:** When appropriate, offer step-by-step instructions, best practices, or actionable recommendations that users can implement.
+
+4. **Include Data:** Use data, statistics, or references to back up your statements and establish credibility.
+
+5. **Maintain a Professional Yet Approachable Tone:** Communicate in a way that is both authoritative and easy to understand.
+
+In terms of response structure, aim to present the information in a clear and organized manner that best suits the user's query. You can use various formatting techniques such as headings, bullet points, numbered lists, and paragraphs to make the response more readable and engaging.
+
+While a typical response might include an introduction, main points, action steps, and a conclusion, feel free to adapt this structure as needed based on the specific query and the information you're conveying.
+
+For example, if the user asks for a brief overview, you can provide a concise summary without detailed steps. If the user requests a step-by-step guide, you can format the response accordingly.
+
+Always ensure that your response is well-formatted and easy to follow, using appropriate formatting elements to highlight important information.
+"""
 
 class AstraDBConfig(BaseModel):
     endpoint: str = os.getenv("ASTRA_DB_ENDPOINT")
@@ -176,19 +186,13 @@ async def startup_event():
 
 # Helper function to handle sports queries using SearchAPI
 async def handle_sports_query(query: str) -> Dict:
-    # Build the SearchAPI URL using the endpoint /api/v1/search?engine=google
-    # According to the YAML, the base URL is: https://www.searchapi.io/api/v1/search?engine=google
-    search_url = (
-        "https://www.searchapi.io/api/v1/search?engine=google"
-        f"&q={query}"
-        f"&api_key={config.searchapi_key}"
-    )
+    search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}"
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(search_url)
             response.raise_for_status()
             search_results = response.json()
-            items = search_results.get("organic_results", [])  # Adjust key as needed based on API response
+            items = search_results.get("organic_results", [])
             results = []
             for item in items[:5]:
                 results.append({
@@ -198,8 +202,8 @@ async def handle_sports_query(query: str) -> Dict:
                 })
             return {"response": results}
         except httpx.HTTPStatusError as e:
-            print(f"SearchAPI error: {e.response.status_code}")
-            return {"error": str(e)}
+            logging.error(f"SearchAPI error: {e.response.status_code}, Details: {str(e)}")
+            return {"error": f"SearchAPI failed with status {e.response.status_code}"}
 
 # Custom Query Engine Creation Function
 def create_custom_query_engine(
@@ -227,12 +231,11 @@ class QueryRequest(BaseModel):
 async def handle_query(request: QueryRequest):
     try:
         query_lower = request.query.lower()
-        # Check for sports-related keywords
         if any(keyword in query_lower for keyword in ["live scores", "fixture", "match", "score", "result"]):
             sports_response = await handle_sports_query(request.query)
             if sports_response:
                 return sports_response
-        # Prepend the Role and Mission prompt to the user's query for general queries
+        # Prepend the Role and Mission prompt to the user's query
         final_query = ROLE_AND_MISSION_PROMPT + "\n\n" + request.query
         query_engine = create_custom_query_engine(
             index=search_index,
@@ -268,9 +271,15 @@ class DocumentUpdate(BaseModel):
 @app.post("/update-documents")
 async def update_documents(update: DocumentUpdate):
     try:
-        index = create_index_from_existing()
-        index.insert(update.documents)
-        return {"message": f"Added {len(update.documents)} documents"}
+        for doc in update.documents:
+            text = doc["text"]
+            metadata = doc.get("metadata", {})  # Assuming each document dict has 'text' and 'metadata' keys
+            embedding = embed_model.get_text_embedding(text)
+            astra_vector_store.add([embedding], documents=[text], metadatas=[metadata])
+        # Recreate the index
+        global search_index
+        search_index = create_index_from_existing()
+        return {"message": f"Added {len(update.documents)} documents and updated the index"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

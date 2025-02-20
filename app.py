@@ -1,15 +1,11 @@
 import os
 import asyncio
 import logging
-import time
 from typing import Dict, Any, List
-import redis.asyncio as redis
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Form, UploadFile, File, WebSocket
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 import httpx
 from astrapy import DataAPIClient
 from astrapy.exceptions import TooManyDocumentsToCountException
@@ -21,16 +17,12 @@ from llama_index.readers.web import SimpleWebPageReader
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core import get_response_synthesizer
 from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.multi_modal_llms.openai import OpenAIMultiModal
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-
-# Redis setup
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 # Global Role and Mission Prompt
 ROLE_AND_MISSION_PROMPT = """
@@ -50,7 +42,9 @@ When crafting your response, consider the following guidelines:
 
 In terms of response structure, aim to present the information in a clear and organized manner that best suits the user's query. You can use various formatting techniques such as headings, bullet points, numbered lists, and paragraphs to make the response more readable and engaging.
 
-For example, if the user asks for a brief overview, provide a concise summary. If the user requests a step-by-step guide, format the response accordingly.
+While a typical response might include an introduction, main points, action steps, and a conclusion, feel free to adapt this structure as needed based on the specific query and the information you're conveying.
+
+For example, if the user asks for a brief overview, you can provide a concise summary without detailed steps. If the user requests a step-by-step guide, you can format the response accordingly.
 
 Always ensure that your response is well-formatted and easy to follow, using appropriate formatting elements to highlight important information.
 """
@@ -65,16 +59,10 @@ class AstraDBConfig(BaseModel):
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
     searchapi_key: str = os.getenv("SEARCHAPI_KEY")
-    newsapi_key: str = os.getenv("NEWSAPI_KEY")  # Add your NewsAPI key to .env
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
 db_config = AstraDBConfig()
-
-# Rate limiter setup
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(429, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,7 +90,6 @@ except Exception as e:
 
 embed_model = OpenAIEmbedding(api_key=config.openai_key, model_name="text-embedding-3-small")
 llm = LlamaOpenAI(model="gpt-3.5-turbo", api_key=config.openai_key, temperature=0.3)
-multi_modal_llm = OpenAIMultiModal(model="gpt-4-vision-preview", api_key=config.openai_key)
 
 def verify_collection_config():
     try:
@@ -114,10 +101,8 @@ def verify_collection_config():
                 options={"vector": {"dimension": db_config.embedding_dim, "metric": "cosine"}}
             )
             print(f"✅ Collection {db_config.collection} created")
-        if "sessions" not in collection_names:
-            db.create_collection("sessions")
-            print("✅ Created sessions collection")
-        print(f"🔍 Collection {db_config.collection} exists")
+        else:
+            print(f"🔍 Collection {db_config.collection} exists")
         collection = db.get_collection(db_config.collection)
         print("✅ Collection verification successful")
     except Exception as e:
@@ -138,7 +123,7 @@ async def initialize_documents() -> VectorStoreIndex:
         web_docs, local_docs = await asyncio.gather(
             web_reader.load_data_async([
                 "https://www.sponsorforce.net/#/portal/home",
-                "https://www.sponsorforce.net/#/portal/topics",
+                "https://www.sponsorforce.net/#/portal/topics",  # Fixed typo from 'topic'
                 "https://www.sponsorforce.net/#/portal/resource"
             ]),
             local_reader.load_data_async()
@@ -191,45 +176,29 @@ async def handle_sports_query(query: str) -> Dict:
             return {"error": f"SearchAPI failed with status {e.response.status_code}"}
 
 async def perform_deep_search(query: str) -> Dict:
+    search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}"
     async with httpx.AsyncClient() as client:
-        search_task = client.get(f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}")
-        news_task = client.get(f"https://newsapi.org/v2/everything?q={query}&apiKey={config.newsapi_key}")
-        
-        search_resp, news_resp = await asyncio.gather(search_task, news_task)
-        
-        synthesized_response = "## Deep Analysis\n\n"
-        sources = []
-        
-        if search_resp.status_code == 200:
-            organic_results = search_resp.json().get("organic_results", [])
-            synthesized_response += "### Web Results\n"
-            for idx, item in enumerate(organic_results[:3], 1):
+        try:
+            response = await client.get(search_url)
+            response.raise_for_status()
+            search_results = response.json()
+            organic_results = search_results.get("organic_results", [])
+            synthesized_response = "Here’s a deep analysis based on the latest available data:\n\n"
+            sources = []
+            for idx, item in enumerate(organic_results[:5], 1):
                 title = item.get("title", "No title")
                 snippet = item.get("snippet", "No description")
                 link = item.get("link", "No link")
-                synthesized_response += f"#### Source {idx}: {title}\n- **Summary:** {snippet}\n- **Link:** {link}\n\n"
+                synthesized_response += f"### Source {idx}: {title}\n"
+                synthesized_response += f"- **Summary:** {snippet}\n"
+                synthesized_response += f"- **Link:** {link}\n\n"
                 sources.append({"title": title, "link": link})
-        
-        if news_resp.status_code == 200:
-            articles = news_resp.json().get("articles", [])
-            synthesized_response += "### News Results\n"
-            for idx, article in enumerate(articles[:2], 1):
-                title = article.get("title", "No title")
-                description = article.get("description", "No description")
-                url = article.get("url", "No url")
-                synthesized_response += f"#### Source {idx}: {title}\n- **Summary:** {description}\n- **Link:** {url}\n\n"
-                sources.append({"title": title, "link": url})
-        
-        synthesized_response += "## Synthesis\nThis analysis combines web and news insights for a comprehensive overview."
-        return {"response": synthesized_response, "sources": sources}
-
-def detect_intent(query: str) -> str:
-    query_lower = query.lower()
-    if "overview" in query_lower:
-        return "compact"
-    elif "step-by-step" in query_lower or "guide" in query_lower:
-        return "tree_summarize"
-    return "refine"
+            synthesized_response += "### Synthesis\n"
+            synthesized_response += "Based on the gathered data, this analysis provides a comprehensive overview of the topic. For further details, refer to the cited sources."
+            return {"response": synthesized_response, "sources": sources}
+        except httpx.HTTPStatusError as e:
+            logging.error(f"Deep search failed: {e.response.status_code}, Details: {str(e)}")
+            return {"error": f"Deep search failed with status {e.response.status_code}"}
 
 def create_custom_query_engine(index: VectorStoreIndex, similarity_top_k: int = 12, response_mode: str = "refine") -> RetrieverQueryEngine:
     retriever = VectorIndexRetriever(index=index, similarity_top_k=similarity_top_k)
@@ -240,55 +209,40 @@ class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
     top_k: int = 5
-    deep_search: bool = False
-    session_id: str = None  # Added for conversational memory
+    deep_search: bool = False  # Added deep_search flag
 
 @app.post("/query")
-@limiter.limit("10/minute")
-async def handle_query(request: QueryRequest, user_id: str = Header(default=None)):
+async def handle_query(request: QueryRequest):
     try:
-        cache_key = f"query:{request.query}:{request.top_k}:{request.deep_search}:{request.session_id}"
-        cached_response = await redis_client.get(cache_key)
-        if cached_response:
-            return {"response": cached_response, "sources": []}
-
         query_lower = request.query.lower()
         if any(keyword in query_lower for keyword in ["live scores", "fixture", "match", "score", "result"]):
             sports_response = await handle_sports_query(request.query)
             if sports_response:
-                await redis_client.setex(cache_key, 3600, str(sports_response["response"]))
                 return sports_response
-
-        # Conversational memory
-        context = ""
-        if request.session_id:
-            session_collection = db.get_collection("sessions")
-            past_queries = await session_collection.find({"session_id": request.session_id}).to_list(length=5)
-            context = "Previous queries:\n" + "\n".join(q["query"] for q in past_queries) + "\n\n"
-            await session_collection.insert_one({"session_id": request.session_id, "query": request.query, "timestamp": int(time.time())})
-
-        final_query = f"{context}{ROLE_AND_MISSION_PROMPT}\n\n{request.query}"
-        response_mode = detect_intent(request.query)
-        
+        final_query = ROLE_AND_MISSION_PROMPT + "\n\n" + request.query
         if request.deep_search:
-            deep_task = perform_deep_search(request.query)
-            query_engine = create_custom_query_engine(index=search_index, similarity_top_k=request.top_k, response_mode=response_mode)
-            vector_task = query_engine.aquery(final_query)
-            deep_response, vector_response = await asyncio.gather(deep_task, vector_task)
+            deep_response = await perform_deep_search(request.query)
             if "error" not in deep_response:
+                query_engine = create_custom_query_engine(
+                    index=search_index,
+                    similarity_top_k=request.top_k,
+                    response_mode="tree_summarize"
+                )
+                vector_response = await query_engine.aquery(final_query)
                 deep_response["response"] += f"\n\n### Additional Insights from Internal Data\n{vector_response.response}"
                 deep_response["sources"].extend([node.metadata for node in vector_response.source_nodes])
-            await redis_client.setex(cache_key, 3600, deep_response["response"])
             return deep_response
         else:
-            query_engine = create_custom_query_engine(index=search_index, similarity_top_k=request.top_k, response_mode=response_mode)
+            query_engine = create_custom_query_engine(
+                index=search_index,
+                similarity_top_k=request.top_k,
+                response_mode="tree_summarize"
+            )
             response = await query_engine.aquery(final_query)
-            formatted_response = {
-                "response": f"## Response\n\n{response.response}",
+            return {
+                "response": response.response,
                 "sources": [node.metadata for node in response.source_nodes]
             }
-            await redis_client.setex(cache_key, 3600, formatted_response["response"])
-            return formatted_response
     except Exception as e:
         logging.error(f"Query processing error: {e}")
         raise HTTPException(status_code=500, detail="Query processing failed")
@@ -317,7 +271,6 @@ async def update_documents(update: DocumentUpdate):
             astra_vector_store.add([embedding], documents=[text], metadatas=[metadata])
         global search_index
         search_index = create_index_from_existing()
-        await redis_client.flushdb()  # Clear cache on update
         return {"message": f"Added {len(update.documents)} documents and updated the index"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -344,19 +297,6 @@ async def health_check():
         }
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
-
-@app.post("/query-with-image")
-async def query_with_image(query: str = Form(...), image: UploadFile = File(...)):
-    try:
-        image_content = await image.read()
-        response = multi_modal_llm.complete(
-            prompt=query,
-            image_documents=[SimpleDirectoryReader.load_image(image_content)]
-        )
-        return {"response": response.text}
-    except Exception as e:
-        logging.error(f"Image query error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

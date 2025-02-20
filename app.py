@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -7,28 +8,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import httpx
 from astrapy import DataAPIClient
-
-# Import exception for document count limits (if needed in other contexts)
 from astrapy.exceptions import TooManyDocumentsToCountException
-
-# Llama Index & Database Components
-from llama_index.core import (
-    VectorStoreIndex,
-    SimpleDirectoryReader,
-    StorageContext,
-)
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.astra_db import AstraDBVectorStore
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.readers.web import SimpleWebPageReader
-
-# Additional components for custom query engine
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core import get_response_synthesizer
 from llama_index.core.query_engine import RetrieverQueryEngine
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 # Global Role and Mission Prompt
 ROLE_AND_MISSION_PROMPT = """
@@ -64,29 +58,23 @@ class AstraDBConfig(BaseModel):
 
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
-    searchapi_key: str = os.getenv("SEARCHAPI_KEY")  # Using SearchAPI for sports queries
+    searchapi_key: str = os.getenv("SEARCHAPI_KEY")
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
 db_config = AstraDBConfig()
 
-# ✅ Add CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Astra DB with DataAPIClient
 client = DataAPIClient(db_config.token)
-db = client.get_database(
-    api_endpoint=db_config.endpoint,
-    namespace=db_config.namespace
-)
+db = client.get_database(api_endpoint=db_config.endpoint, namespace=db_config.namespace)
 
-# Initialize Astra DB vector store with enhanced configuration
 try:
     astra_vector_store = AstraDBVectorStore(
         token=db_config.token,
@@ -100,32 +88,17 @@ except Exception as e:
     print(f"❌ Astra DB connection failed: {e}")
     raise
 
-# Initialize AI models
-embed_model = OpenAIEmbedding(
-    api_key=config.openai_key,
-    model_name="text-embedding-3-small"
-)
-
-llm = LlamaOpenAI(
-    model="gpt-3.5-turbo",
-    api_key=config.openai_key,
-    temperature=0.3
-)
+embed_model = OpenAIEmbedding(api_key=config.openai_key, model_name="text-embedding-3-small")
+llm = LlamaOpenAI(model="gpt-3.5-turbo", api_key=config.openai_key, temperature=0.3)
 
 def verify_collection_config():
-    """Verify or create collection with vector configuration"""
     try:
         collection_names = [c.name for c in db.list_collections()]
         if db_config.collection not in collection_names:
             print(f"🆕 Creating collection {db_config.collection}")
             db.create_collection(
                 name=db_config.collection,
-                options={
-                    "vector": {
-                        "dimension": db_config.embedding_dim,
-                        "metric": "cosine"
-                    }
-                }
+                options={"vector": {"dimension": db_config.embedding_dim, "metric": "cosine"}}
             )
             print(f"✅ Collection {db_config.collection} created")
         else:
@@ -137,7 +110,6 @@ def verify_collection_config():
         raise
 
 def create_index_from_existing() -> VectorStoreIndex:
-    """Create index from existing vector store"""
     return VectorStoreIndex.from_vector_store(
         vector_store=astra_vector_store,
         embed_model=embed_model,
@@ -145,14 +117,13 @@ def create_index_from_existing() -> VectorStoreIndex:
     )
 
 async def initialize_documents() -> VectorStoreIndex:
-    """Initialize document sources and create vector index"""
     try:
         web_reader = SimpleWebPageReader()
         local_reader = SimpleDirectoryReader("./data/")
         web_docs, local_docs = await asyncio.gather(
             web_reader.load_data_async([
                 "https://www.sponsorforce.net/#/portal/home",
-                "https://www.sponsorforce.net/#/portal/topic",
+                "https://www.sponsorforce.net/#/portal/topics",  # Fixed typo from 'topic'
                 "https://www.sponsorforce.net/#/portal/resource"
             ]),
             local_reader.load_data_async()
@@ -184,7 +155,6 @@ async def startup_event():
         print(f"❌ Startup failed: {e}")
         raise
 
-# Helper function to handle sports queries using SearchAPI
 async def handle_sports_query(query: str) -> Dict:
     search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}"
     async with httpx.AsyncClient() as client:
@@ -205,27 +175,41 @@ async def handle_sports_query(query: str) -> Dict:
             logging.error(f"SearchAPI error: {e.response.status_code}, Details: {str(e)}")
             return {"error": f"SearchAPI failed with status {e.response.status_code}"}
 
-# Custom Query Engine Creation Function
-def create_custom_query_engine(
-    index: VectorStoreIndex,
-    similarity_top_k: int = 12,
-    response_mode: str = "refine"
-) -> RetrieverQueryEngine:
-    retriever = VectorIndexRetriever(
-        index=index,
-        similarity_top_k=similarity_top_k,
-    )
+async def perform_deep_search(query: str) -> Dict:
+    search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(search_url)
+            response.raise_for_status()
+            search_results = response.json()
+            organic_results = search_results.get("organic_results", [])
+            synthesized_response = "Here’s a deep analysis based on the latest available data:\n\n"
+            sources = []
+            for idx, item in enumerate(organic_results[:5], 1):
+                title = item.get("title", "No title")
+                snippet = item.get("snippet", "No description")
+                link = item.get("link", "No link")
+                synthesized_response += f"### Source {idx}: {title}\n"
+                synthesized_response += f"- **Summary:** {snippet}\n"
+                synthesized_response += f"- **Link:** {link}\n\n"
+                sources.append({"title": title, "link": link})
+            synthesized_response += "### Synthesis\n"
+            synthesized_response += "Based on the gathered data, this analysis provides a comprehensive overview of the topic. For further details, refer to the cited sources."
+            return {"response": synthesized_response, "sources": sources}
+        except httpx.HTTPStatusError as e:
+            logging.error(f"Deep search failed: {e.response.status_code}, Details: {str(e)}")
+            return {"error": f"Deep search failed with status {e.response.status_code}"}
+
+def create_custom_query_engine(index: VectorStoreIndex, similarity_top_k: int = 12, response_mode: str = "refine") -> RetrieverQueryEngine:
+    retriever = VectorIndexRetriever(index=index, similarity_top_k=similarity_top_k)
     response_synthesizer = get_response_synthesizer(response_mode=response_mode)
-    query_engine = RetrieverQueryEngine(
-        retriever=retriever,
-        response_synthesizer=response_synthesizer,
-    )
-    return query_engine
+    return RetrieverQueryEngine(retriever=retriever, response_synthesizer=response_synthesizer)
 
 class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
     top_k: int = 5
+    deep_search: bool = False  # Added deep_search flag
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
@@ -235,20 +219,32 @@ async def handle_query(request: QueryRequest):
             sports_response = await handle_sports_query(request.query)
             if sports_response:
                 return sports_response
-        # Prepend the Role and Mission prompt to the user's query
         final_query = ROLE_AND_MISSION_PROMPT + "\n\n" + request.query
-        query_engine = create_custom_query_engine(
-            index=search_index,
-            similarity_top_k=request.top_k,
-            response_mode="tree_summarize"
-        )
-        response = await query_engine.aquery(final_query)
-        return {
-            "response": response.response,
-            "sources": [node.metadata for node in response.source_nodes]
-        }
+        if request.deep_search:
+            deep_response = await perform_deep_search(request.query)
+            if "error" not in deep_response:
+                query_engine = create_custom_query_engine(
+                    index=search_index,
+                    similarity_top_k=request.top_k,
+                    response_mode="tree_summarize"
+                )
+                vector_response = await query_engine.aquery(final_query)
+                deep_response["response"] += f"\n\n### Additional Insights from Internal Data\n{vector_response.response}"
+                deep_response["sources"].extend([node.metadata for node in vector_response.source_nodes])
+            return deep_response
+        else:
+            query_engine = create_custom_query_engine(
+                index=search_index,
+                similarity_top_k=request.top_k,
+                response_mode="tree_summarize"
+            )
+            response = await query_engine.aquery(final_query)
+            return {
+                "response": response.response,
+                "sources": [node.metadata for node in response.source_nodes]
+            }
     except Exception as e:
-        print(f"❌ Query processing error: {e}")
+        logging.error(f"Query processing error: {e}")
         raise HTTPException(status_code=500, detail="Query processing failed")
 
 @app.get("/collection-info")
@@ -258,10 +254,7 @@ async def get_collection_info():
         count_result = collection.estimated_document_count()
         count = count_result["status"]["count"] if isinstance(count_result, dict) else count_result
         sample = collection.find_one({})["data"]["document"]
-        return {
-            "total_documents": count,
-            "sample_document": sample
-        }
+        return {"total_documents": count, "sample_document": sample}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -273,10 +266,9 @@ async def update_documents(update: DocumentUpdate):
     try:
         for doc in update.documents:
             text = doc["text"]
-            metadata = doc.get("metadata", {})  # Assuming each document dict has 'text' and 'metadata' keys
+            metadata = doc.get("metadata", {})
             embedding = embed_model.get_text_embedding(text)
             astra_vector_store.add([embedding], documents=[text], metadatas=[metadata])
-        # Recreate the index
         global search_index
         search_index = create_index_from_existing()
         return {"message": f"Added {len(update.documents)} documents and updated the index"}

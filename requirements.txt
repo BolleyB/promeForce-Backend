@@ -13,3 +13,4 @@ openai>=1.0.0
 redis>=5.0.1
 slowapi>=0.1.9
 newsapi-python>=0.2.7
+python-multipart>=0.0.12

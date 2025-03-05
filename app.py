@@ -145,7 +145,8 @@ async def update_sports_data():
         web_reader = SimpleWebPageReader()
         sports_docs = await web_reader.load_data_async([
             "https://www.bbc.com/sport/football",
-            "https://www.skysports.com/premier-league-news"
+            "https://www.skysports.com/premier-league-news",
+            "https://www.nba.com/schedule"  # Added NBA source
         ])
         embeddings = [embed_model.get_text_embedding(doc.text) for doc in sports_docs]
         astra_vector_store.add(embeddings, documents=[d.text for d in sports_docs], metadatas=[d.metadata for d in sports_docs])
@@ -179,7 +180,6 @@ async def startup_event():
         raise
 
 async def fetch_sports_data(query: str, timeframe: str = None) -> Dict:
-    # Use SearchAPI for all sports queries
     url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}&tbs=qdr:{timeframe[0] if timeframe else 'h'}"
     async with httpx.AsyncClient() as client:
         try:
@@ -194,15 +194,9 @@ async def fetch_sports_data(query: str, timeframe: str = None) -> Dict:
             return {"error": str(e)}
 
 async def fetch_x_posts(query: str, timeframe_hours: int = 24) -> List[Dict]:
-    try:
-        auth = tweepy.OAuth2BearerHandler(config.x_bearer_token)
-        api = tweepy.API(auth)
-        since_time = (datetime.now() - timedelta(hours=timeframe_hours)).strftime("%Y-%m-%d")
-        tweets = api.search_tweets(q=query, count=10, since=since_time, tweet_mode="extended")
-        return [{"text": t.full_text, "user": t.user.screen_name, "created_at": str(t.created_at)} for t in tweets]
-    except Exception as e:
-        logging.error(f"X fetch error: {e}")
-        return []
+    # Temporarily disabled due to X API limitations
+    logging.info("X fetch disabled due to API access restrictions")
+    return []
 
 async def perform_deep_search(query: str, timeframe: str = None) -> Dict:
     search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}&tbs=qdr:{timeframe[0] if timeframe else 'h'}"
@@ -235,7 +229,7 @@ def create_custom_query_engine(index: VectorStoreIndex, similarity_top_k: int = 
     return RetrieverQueryEngine(retriever=retriever, response_synthesizer=response_synthesizer)
 
 def format_response(raw_response: str, query: str) -> str:
-    if "list" in query.lower():
+    if "list" in query.lower() or "schedule" in query.lower():
         items = raw_response.split("\n")
         return "\n".join([f"- {item.strip()}" for item in items if item.strip()])
     elif "latest" in query.lower():
@@ -255,21 +249,25 @@ async def handle_query(request: QueryRequest):
         timeframe = "24h" if "last 24 hours" in query_lower else "48h" if "last 48 hours" in query_lower else None
         logging.info(f"Processing query: {request.query}, timeframe: {timeframe}")
 
-        # Handle sports-specific queries with SearchAPI
-        if any(keyword in query_lower for keyword in ["fixture", "match", "score", "standing", "result", "headlines"]):
+        # Broadened sports detection
+        sports_keywords = ["nba", "football", "premier league", "fixture", "match", "score", "standing", "result", "headlines", "schedule"]
+        if any(keyword in query_lower for keyword in sports_keywords):
             logging.info("Fetching sports data via SearchAPI")
             sports_response = await fetch_sports_data(request.query, timeframe)
-            if "error" not in sports_response:
-                logging.info(f"Sports data fetched: {sports_response}")
-                return sports_response
-            logging.warning(f"Sports data fetch failed: {sports_response.get('error')}")
+            if "error" not in sports_response and sports_response["response"]:
+                # Format SearchAPI results directly
+                formatted_response = f"### {request.query}\nAs of {datetime.now().strftime('%Y-%m-%d %H:%M PST')}:\n"
+                for result in sports_response["response"]:
+                    formatted_response += f"- **{result['title']}**: {result['snippet']} ([Source]({result['link']}))\n"
+                formatted_response += "\n### Note\nThese results are sourced from recent web data. For exact times, check official schedules."
+                logging.info(f"Sports data fetched and formatted: {formatted_response[:100]}...")
+                return {"response": formatted_response, "sources": [{"title": r["title"], "link": r["link"]} for r in sports_response["response"]]}
 
-        # Construct query with prompt and context
+        # Fallback to vector store with X context
         structured_query = f"{ROLE_AND_MISSION_PROMPT}\n\nCurrent date: {datetime.now().strftime('%Y-%m-%d %H:%M PST')}\nQuery: {request.query}"
         if timeframe:
             structured_query += f"\nFilter to {timeframe} timeframe."
         
-        # Fetch X posts for real-time context
         logging.info("Fetching X posts")
         x_posts = await fetch_x_posts(request.query, 24 if timeframe == "24h" else 48 if timeframe == "48h" else 24)
         if x_posts:
@@ -278,11 +276,9 @@ async def handle_query(request: QueryRequest):
         else:
             logging.warning("No X posts fetched")
 
-        # Query engine with vector store
         query_engine = create_custom_query_engine(search_index, request.top_k, "tree_summarize")
         response = await query_engine.aquery(structured_query)
         
-        # Post-process to ensure specificity
         formatted_response = format_response(response.response, request.query)
         if "[Company X]" in formatted_response or "[Player A]" in formatted_response:
             logging.info("Detected placeholders, performing deep search")

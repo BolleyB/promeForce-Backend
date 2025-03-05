@@ -2,11 +2,14 @@ import os
 import asyncio
 import logging
 from typing import Dict, Any, List
+from datetime import datetime, timedelta
+import re
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import httpx
+import tweepy
 from astrapy import DataAPIClient
 from astrapy.exceptions import TooManyDocumentsToCountException
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
@@ -17,6 +20,7 @@ from llama_index.readers.web import SimpleWebPageReader
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core import get_response_synthesizer
 from llama_index.core.query_engine import RetrieverQueryEngine
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Load environment variables
 load_dotenv()
@@ -24,30 +28,29 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Global Role and Mission Prompt
+# Updated Role and Mission Prompt (broadened for sports)
 ROLE_AND_MISSION_PROMPT = """
-You are an expert in sponsorship strategies, marketing, and business development. Your role is to provide high-quality, informative responses that empower users to understand and excel in these fields.
+You are an expert in sponsorship strategies, marketing, business development, and sports (including football, basketball, cricket, tennis, and motorsport). Your role is to provide high-quality, informative responses that empower users to understand and excel in these fields, delivering precise, specific answers tailored to the query.
 
 When crafting your response, adhere to these guidelines:
 
-1. **Educate and Inspire:** Deliver in-depth insights and practical advice that enhance the user’s knowledge and confidence. Avoid vague or generic statements—always provide specific, named examples (e.g., companies, campaigns, or individuals) instead of placeholders like “[Company X]” or “[Example A].”
-2. **Leverage Real-World Context:** Incorporate relevant examples, current industry trends, or case studies to make your response engaging and relatable. Draw from real-time sources like web articles, X posts, or industry reports when applicable, especially for queries involving “latest” developments.
-3. **Provide Actionable Guidance:** Include clear, step-by-step instructions, best practices, or recommendations by default, unless the user requests a brief overview. Ensure the user can implement your advice practically.
-4. **Back Up with Data:** Support your points with credible data, statistics, or references (e.g., “Per a 2024 Statista report, 65% of brands increased sponsorship budgets”). Cite sources and timestamps when using real-time information (e.g., “X post by @IndustryExpert, March 4, 2025”).
-5. **Maintain a Professional Yet Approachable Tone:** Communicate authoritatively but in an accessible, conversational style that avoids jargon overload.
+1. **Educate and Inspire:** Provide in-depth insights and practical advice that boost the user’s knowledge and confidence. Always use specific, named examples (e.g., “Nike’s $1.5B NFL deal” or “Arsenal’s 7-1 win over PSV”) instead of vague placeholders like “[Company X]” or “[Player A].”
+2. **Leverage Real-World Context:** Incorporate current examples, industry trends, or case studies to make responses engaging and relevant. For time-sensitive queries (e.g., “latest headlines”), draw from real-time sources like web articles, X posts, or official updates, ensuring data aligns with the specified timeframe (e.g., last 24 hours).
+3. **Provide Actionable Guidance:** Include clear, step-by-step instructions, best practices, or recommendations by default, unless a brief overview is requested. Ensure advice is practical and implementable.
+4. **Back Up with Data:** Support claims with credible data, statistics, or references (e.g., “Per Statista 2024, 65% of brands increased sponsorship budgets” or “X post by @FutballNews_, March 4, 2025”). Include timestamps for real-time sources and note the current date (e.g., March 5, 2025).
+5. **Maintain a Professional Yet Approachable Tone:** Communicate authoritatively in an accessible, conversational style, avoiding jargon unless explained.
 
 **Response Structure:**
-- Default to a clear, organized format: an introduction (context), main points (details/examples), actionable steps (if applicable), and a conclusion (summary or next steps).
-- Use headings, bullet points, numbered lists, or bold text to enhance readability and highlight key information.
-- Adapt the depth based on the query: provide a concise summary for overview requests, or a detailed guide with examples and steps for specific “how-to” questions.
-- For time-sensitive queries (e.g., “latest trends as of [date]”), filter information to the specified timeframe (e.g., last 48 hours) and note the current date (e.g., March 5, 2025).
+- Use a clear, organized format: an introduction (context or timeframe, e.g., “Last 24 hours as of March 5, 2025”), main points (details with examples), actionable steps (if applicable), and a conclusion (summary or next steps).
+- Enhance readability with headings, bullet points, numbered lists, or bold text to highlight key details.
+- Adapt depth to the query: concise summaries for overviews, detailed guides with specifics for “how-to” or “list” requests.
 
 **Additional Instructions:**
-- If real-time data is relevant, search the web or X for up-to-date insights and integrate them seamlessly.
-- Avoid hypothetical or outdated examples—prioritize current, verifiable information.
-- If unsure of specifics, estimate based on trends and note the assumption (e.g., “Likely valued at $10M based on 2024 market rates”).
+- For time-sensitive queries, filter data to the exact timeframe (e.g., last 24 hours from March 4, 07:24 AM PST to March 5, 07:24 AM PST) and fetch real-time insights from X, the web, or sports databases.
+- Prioritize current, verifiable information over hypothetical or outdated examples. If specifics are unavailable, estimate based on trends and flag assumptions (e.g., “Likely £40M based on 2024 market rates”).
+- Cite sources clearly (e.g., “Per @YohaigNG, March 4, 2025”) to build credibility.
 
-Ensure every response is well-formatted, easy to follow, and leaves the user with clear takeaways or solutions.
+Ensure responses are well-formatted, specific, and leave the user with clear, actionable takeaways or solutions, regardless of the topic.
 """
 
 class AstraDBConfig(BaseModel):
@@ -60,6 +63,8 @@ class AstraDBConfig(BaseModel):
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
     searchapi_key: str = os.getenv("SEARCHAPI_KEY")
+    sportsdb_key: str = os.getenv("SPORTSDB_API_KEY")
+    x_bearer_token: str = os.getenv("X_BEARER_TOKEN")
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
@@ -124,7 +129,7 @@ async def initialize_documents() -> VectorStoreIndex:
         web_docs, local_docs = await asyncio.gather(
             web_reader.load_data_async([
                 "https://www.sponsorforce.net/#/portal/home",
-                "https://www.sponsorforce.net/#/portal/topics",  # Fixed typo from 'topic'
+                "https://www.sponsorforce.net/#/portal/topics",
                 "https://www.sponsorforce.net/#/portal/resource"
             ]),
             local_reader.load_data_async()
@@ -137,6 +142,21 @@ async def initialize_documents() -> VectorStoreIndex:
     except Exception as e:
         print(f"❌ Document initialization failed: {e}")
         raise
+
+async def update_sports_data():
+    try:
+        web_reader = SimpleWebPageReader()
+        sports_docs = await web_reader.load_data_async([
+            "https://www.bbc.com/sport/football",
+            "https://www.skysports.com/premier-league-news"
+        ])
+        embeddings = [embed_model.get_text_embedding(doc.text) for doc in sports_docs]
+        astra_vector_store.add(embeddings, documents=[d.text for d in sports_docs], metadatas=[d.metadata for d in sports_docs])
+        global search_index
+        search_index = create_index_from_existing()
+        print("✅ Sports data updated in vector store")
+    except Exception as e:
+        print(f"❌ Sports data update failed: {e}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -152,32 +172,58 @@ async def startup_event():
         else:
             print(f"🔍 Found existing collection with {count} documents")
             search_index = create_index_from_existing()
+        
+        # Start background sports data updates
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(update_sports_data, "interval", hours=6)
+        scheduler.start()
+        print("✅ Background scheduler started")
     except Exception as e:
         print(f"❌ Startup failed: {e}")
         raise
 
-async def handle_sports_query(query: str) -> Dict:
-    search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}"
+async def fetch_sports_data(query: str, timeframe: str = None) -> Dict:
+    base_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}"
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(search_url)
+            if "fixture" in query.lower() or "match" in query.lower():
+                date_match = re.search(r"March \d{1,2}, 2025", query)
+                date = date_match.group().replace("March ", "").replace(", 2025", "") if date_match else "04"
+                url = f"{base_url}/eventsday.php?d=2025-03-{date}"
+                response = await client.get(url)
+                response.raise_for_status()
+                data = response.json()
+                if data["events"]:
+                    return {"response": [{"team1": e["strHomeTeam"], "team2": e["strAwayTeam"], "time": e["strTime"]} for e in data["events"]]}
+            elif "standing" in query.lower():
+                url = f"{base_url}/lookuptable.php?l=4328&s=2024-2025"  # Premier League
+                response = await client.get(url)
+                response.raise_for_status()
+                data = response.json()
+                if data["table"]:
+                    return {"response": [{"team": t["name"], "points": t["points"]} for t in data["table"][:10]]}
+            url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}&tbs=qdr:{timeframe[0] if timeframe else 'h'}"
+            response = await client.get(url)
             response.raise_for_status()
             search_results = response.json()
-            items = search_results.get("organic_results", [])
-            results = []
-            for item in items[:5]:
-                results.append({
-                    "title": item.get("title"),
-                    "snippet": item.get("snippet") or item.get("description"),
-                    "link": item.get("link")
-                })
-            return {"response": results}
+            return {"response": [{"title": r["title"], "snippet": r["snippet"], "link": r["link"]} for r in search_results.get("organic_results", [])[:5]]}
         except httpx.HTTPStatusError as e:
-            logging.error(f"SearchAPI error: {e.response.status_code}, Details: {str(e)}")
-            return {"error": f"SearchAPI failed with status {e.response.status_code}"}
+            logging.error(f"Sports API error: {e.response.status_code}")
+            return {"error": str(e)}
 
-async def perform_deep_search(query: str) -> Dict:
-    search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}"
+async def fetch_x_posts(query: str, timeframe_hours: int = 24) -> List[Dict]:
+    try:
+        auth = tweepy.OAuth2BearerHandler(config.x_bearer_token)
+        api = tweepy.API(auth)
+        since_time = (datetime.now() - timedelta(hours=timeframe_hours)).strftime("%Y-%m-%d")
+        tweets = api.search_tweets(q=query, count=10, since=since_time, tweet_mode="extended")
+        return [{"text": t.full_text, "user": t.user.screen_name, "created_at": str(t.created_at)} for t in tweets]
+    except Exception as e:
+        logging.error(f"X fetch error: {e}")
+        return []
+
+async def perform_deep_search(query: str, timeframe: str = None) -> Dict:
+    search_url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}&tbs=qdr:{timeframe[0] if timeframe else 'h'}"
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(search_url)
@@ -195,55 +241,67 @@ async def perform_deep_search(query: str) -> Dict:
                 synthesized_response += f"- **Link:** {link}\n\n"
                 sources.append({"title": title, "link": link})
             synthesized_response += "### Synthesis\n"
-            synthesized_response += "Based on the gathered data, this analysis provides a comprehensive overview of the topic. For further details, refer to the cited sources."
+            synthesized_response += "This analysis compiles the most relevant insights from recent sources."
             return {"response": synthesized_response, "sources": sources}
         except httpx.HTTPStatusError as e:
-            logging.error(f"Deep search failed: {e.response.status_code}, Details: {str(e)}")
+            logging.error(f"Deep search failed: {e.response.status_code}")
             return {"error": f"Deep search failed with status {e.response.status_code}"}
 
-def create_custom_query_engine(index: VectorStoreIndex, similarity_top_k: int = 12, response_mode: str = "refine") -> RetrieverQueryEngine:
+def create_custom_query_engine(index: VectorStoreIndex, similarity_top_k: int = 12, response_mode: str = "tree_summarize") -> RetrieverQueryEngine:
     retriever = VectorIndexRetriever(index=index, similarity_top_k=similarity_top_k)
     response_synthesizer = get_response_synthesizer(response_mode=response_mode)
     return RetrieverQueryEngine(retriever=retriever, response_synthesizer=response_synthesizer)
+
+def format_response(raw_response: str, query: str) -> str:
+    if "list" in query.lower():
+        items = raw_response.split("\n")
+        return "\n".join([f"- {item.strip()}" for item in items if item.strip()])
+    elif "latest" in query.lower():
+        return f"### Latest Updates\n{raw_response}\n### Conclusion\nSee cited sources for more details."
+    return raw_response
 
 class QueryRequest(BaseModel):
     query: str
     filters: Dict[str, Any] = None
     top_k: int = 5
-    deep_search: bool = False  # Added deep_search flag
+    deep_search: bool = False
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
     try:
         query_lower = request.query.lower()
-        if any(keyword in query_lower for keyword in ["live scores", "fixture", "match", "score", "result"]):
-            sports_response = await handle_sports_query(request.query)
-            if sports_response:
+        timeframe = "24h" if "last 24 hours" in query_lower else "48h" if "last 48 hours" in query_lower else None
+        
+        # Handle sports-specific queries with API
+        if any(keyword in query_lower for keyword in ["fixture", "match", "score", "standing", "result"]):
+            sports_response = await fetch_sports_data(request.query, timeframe)
+            if "error" not in sports_response:
                 return sports_response
-        final_query = ROLE_AND_MISSION_PROMPT + "\n\n" + request.query
-        if request.deep_search:
-            deep_response = await perform_deep_search(request.query)
-            if "error" not in deep_response:
-                query_engine = create_custom_query_engine(
-                    index=search_index,
-                    similarity_top_k=request.top_k,
-                    response_mode="tree_summarize"
-                )
-                vector_response = await query_engine.aquery(final_query)
-                deep_response["response"] += f"\n\n### Additional Insights from Internal Data\n{vector_response.response}"
-                deep_response["sources"].extend([node.metadata for node in vector_response.source_nodes])
-            return deep_response
-        else:
-            query_engine = create_custom_query_engine(
-                index=search_index,
-                similarity_top_k=request.top_k,
-                response_mode="tree_summarize"
-            )
-            response = await query_engine.aquery(final_query)
-            return {
-                "response": response.response,
-                "sources": [node.metadata for node in response.source_nodes]
-            }
+        
+        # Construct query with prompt and context
+        structured_query = f"{ROLE_AND_MISSION_PROMPT}\n\nCurrent date: {datetime.now().strftime('%Y-%m-%d %H:%M PST')}\nQuery: {request.query}"
+        if timeframe:
+            structured_query += f"\nFilter to {timeframe} timeframe."
+        
+        # Fetch X posts for real-time context
+        x_posts = await fetch_x_posts(request.query, 24 if timeframe == "24h" else 48 if timeframe == "48h" else 24)
+        if x_posts:
+            structured_query += "\n\nRecent X Posts:\n" + "\n".join([f"- @{p['user']}: {p['text']} ({p['created_at']})" for p in x_posts])
+
+        # Query engine
+        query_engine = create_custom_query_engine(search_index, request.top_k, "tree_summarize")
+        response = await query_engine.aquery(structured_query)
+        
+        # Post-process to ensure specificity
+        formatted_response = format_response(response.response, request.query)
+        if "[Company X]" in formatted_response or "[Player A]" in formatted_response:
+            deep_response = await perform_deep_search(request.query, timeframe)
+            formatted_response += f"\n\n### Additional Insights\n{deep_response['response']}"
+        
+        return {
+            "response": formatted_response,
+            "sources": [node.metadata for node in response.source_nodes] + [{"title": f"X: @{p['user']}", "link": p["created_at"]} for p in x_posts]
+        }
     except Exception as e:
         logging.error(f"Query processing error: {e}")
         raise HTTPException(status_code=500, detail="Query processing failed")
@@ -275,16 +333,6 @@ async def update_documents(update: DocumentUpdate):
         return {"message": f"Added {len(update.documents)} documents and updated the index"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-async def fetch_sports_data(url: str) -> Dict:
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            print(f"Sports API error: {e.response.status_code}")
-            return {"error": str(e)}
 
 @app.get("/health")
 async def health_check():

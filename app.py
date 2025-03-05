@@ -3,15 +3,13 @@ import asyncio
 import logging
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
-import re
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import httpx
 import tweepy
 from astrapy import DataAPIClient
-from astrapy.exceptions import TooManyDocumentsToCountException
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.astra_db import AstraDBVectorStore
@@ -28,7 +26,7 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Updated Role and Mission Prompt (broadened for sports)
+# Role and Mission Prompt
 ROLE_AND_MISSION_PROMPT = """
 You are an expert in sponsorship strategies, marketing, business development, and sports (including football, basketball, cricket, tennis, and motorsport). Your role is to provide high-quality, informative responses that empower users to understand and excel in these fields, delivering precise, specific answers tailored to the query.
 
@@ -46,7 +44,7 @@ When crafting your response, adhere to these guidelines:
 - Adapt depth to the query: concise summaries for overviews, detailed guides with specifics for “how-to” or “list” requests.
 
 **Additional Instructions:**
-- For time-sensitive queries, filter data to the exact timeframe (e.g., last 24 hours from March 4, 07:24 AM PST to March 5, 07:24 AM PST) and fetch real-time insights from X, the web, or sports databases.
+- For time-sensitive queries, filter data to the exact timeframe (e.g., last 24 hours from March 4, 07:24 AM PST to March 5, 07:24 AM PST) and fetch real-time insights from X or the web via SearchAPI.
 - Prioritize current, verifiable information over hypothetical or outdated examples. If specifics are unavailable, estimate based on trends and flag assumptions (e.g., “Likely £40M based on 2024 market rates”).
 - Cite sources clearly (e.g., “Per @YohaigNG, March 4, 2025”) to build credibility.
 
@@ -63,7 +61,6 @@ class AstraDBConfig(BaseModel):
 class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
     searchapi_key: str = os.getenv("SEARCHAPI_KEY")
-    sportsdb_key: str = os.getenv("SPORTSDB_API_KEY")
     x_bearer_token: str = os.getenv("X_BEARER_TOKEN")
 
 app = FastAPI(title="SponsorForce AI Backend")
@@ -173,7 +170,6 @@ async def startup_event():
             print(f"🔍 Found existing collection with {count} documents")
             search_index = create_index_from_existing()
         
-        # Start background sports data updates
         scheduler = AsyncIOScheduler()
         scheduler.add_job(update_sports_data, "interval", hours=6)
         scheduler.start()
@@ -183,32 +179,18 @@ async def startup_event():
         raise
 
 async def fetch_sports_data(query: str, timeframe: str = None) -> Dict:
-    base_url = f"https://www.thesportsdb.com/api/v1/json/{config.sportsdb_key}"
+    # Use SearchAPI for all sports queries
+    url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}&tbs=qdr:{timeframe[0] if timeframe else 'h'}"
     async with httpx.AsyncClient() as client:
         try:
-            if "fixture" in query.lower() or "match" in query.lower():
-                date_match = re.search(r"March \d{1,2}, 2025", query)
-                date = date_match.group().replace("March ", "").replace(", 2025", "") if date_match else "04"
-                url = f"{base_url}/eventsday.php?d=2025-03-{date}"
-                response = await client.get(url)
-                response.raise_for_status()
-                data = response.json()
-                if data["events"]:
-                    return {"response": [{"team1": e["strHomeTeam"], "team2": e["strAwayTeam"], "time": e["strTime"]} for e in data["events"]]}
-            elif "standing" in query.lower():
-                url = f"{base_url}/lookuptable.php?l=4328&s=2024-2025"  # Premier League
-                response = await client.get(url)
-                response.raise_for_status()
-                data = response.json()
-                if data["table"]:
-                    return {"response": [{"team": t["name"], "points": t["points"]} for t in data["table"][:10]]}
-            url = f"https://www.searchapi.io/api/v1/search?engine=google&q={query}&api_key={config.searchapi_key}&tbs=qdr:{timeframe[0] if timeframe else 'h'}"
             response = await client.get(url)
             response.raise_for_status()
             search_results = response.json()
-            return {"response": [{"title": r["title"], "snippet": r["snippet"], "link": r["link"]} for r in search_results.get("organic_results", [])[:5]]}
+            results = [{"title": r["title"], "snippet": r["snippet"], "link": r["link"]} for r in search_results.get("organic_results", [])[:5]]
+            logging.info(f"Fetched {len(results)} results from SearchAPI for query: {query}")
+            return {"response": results}
         except httpx.HTTPStatusError as e:
-            logging.error(f"Sports API error: {e.response.status_code}")
+            logging.error(f"SearchAPI error: {e.response.status_code}")
             return {"error": str(e)}
 
 async def fetch_x_posts(query: str, timeframe_hours: int = 24) -> List[Dict]:
@@ -271,40 +253,50 @@ async def handle_query(request: QueryRequest):
     try:
         query_lower = request.query.lower()
         timeframe = "24h" if "last 24 hours" in query_lower else "48h" if "last 48 hours" in query_lower else None
-        
-        # Handle sports-specific queries with API
-        if any(keyword in query_lower for keyword in ["fixture", "match", "score", "standing", "result"]):
+        logging.info(f"Processing query: {request.query}, timeframe: {timeframe}")
+
+        # Handle sports-specific queries with SearchAPI
+        if any(keyword in query_lower for keyword in ["fixture", "match", "score", "standing", "result", "headlines"]):
+            logging.info("Fetching sports data via SearchAPI")
             sports_response = await fetch_sports_data(request.query, timeframe)
             if "error" not in sports_response:
+                logging.info(f"Sports data fetched: {sports_response}")
                 return sports_response
-        
+            logging.warning(f"Sports data fetch failed: {sports_response.get('error')}")
+
         # Construct query with prompt and context
         structured_query = f"{ROLE_AND_MISSION_PROMPT}\n\nCurrent date: {datetime.now().strftime('%Y-%m-%d %H:%M PST')}\nQuery: {request.query}"
         if timeframe:
             structured_query += f"\nFilter to {timeframe} timeframe."
         
         # Fetch X posts for real-time context
+        logging.info("Fetching X posts")
         x_posts = await fetch_x_posts(request.query, 24 if timeframe == "24h" else 48 if timeframe == "48h" else 24)
         if x_posts:
             structured_query += "\n\nRecent X Posts:\n" + "\n".join([f"- @{p['user']}: {p['text']} ({p['created_at']})" for p in x_posts])
+            logging.info(f"X posts fetched: {len(x_posts)} posts")
+        else:
+            logging.warning("No X posts fetched")
 
-        # Query engine
+        # Query engine with vector store
         query_engine = create_custom_query_engine(search_index, request.top_k, "tree_summarize")
         response = await query_engine.aquery(structured_query)
         
         # Post-process to ensure specificity
         formatted_response = format_response(response.response, request.query)
         if "[Company X]" in formatted_response or "[Player A]" in formatted_response:
+            logging.info("Detected placeholders, performing deep search")
             deep_response = await perform_deep_search(request.query, timeframe)
             formatted_response += f"\n\n### Additional Insights\n{deep_response['response']}"
         
+        logging.info(f"Final response: {formatted_response[:100]}...")
         return {
             "response": formatted_response,
             "sources": [node.metadata for node in response.source_nodes] + [{"title": f"X: @{p['user']}", "link": p["created_at"]} for p in x_posts]
         }
     except Exception as e:
         logging.error(f"Query processing error: {e}")
-        raise HTTPException(status_code=500, detail="Query processing failed")
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
 @app.get("/collection-info")
 async def get_collection_info():

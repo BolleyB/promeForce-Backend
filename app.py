@@ -28,14 +28,14 @@ logging.basicConfig(level=logging.INFO)
 
 # Role and Mission Prompt
 ROLE_AND_MISSION_PROMPT = """
-You are an expert in sponsorship strategies, marketing, business development, and sports (including football, basketball, cricket, tennis, and motorsport). Your role is to provide high-quality, informative responses that empower users to understand and excel in these fields, delivering precise, specific answers tailored to the query.
+You are an expert in sponsorship strategies, marketing, business development, and sports (including football, basketball, cricket, tennis, and motorsport). You also specialize in providing information from sponsorforce.net about sponsorships, articles, and resources. Your role is to provide high-quality, informative responses that empower users to understand and excel in these fields, delivering precise, specific answers tailored to the query.
 
 When crafting your response, adhere to these guidelines:
 
-1. **Educate and Inspire:** Provide in-depth insights and practical advice that boost the user’s knowledge and confidence. Always use specific, named examples (e.g., “Nike’s $1.5B NFL deal” or “Arsenal’s 7-1 win over PSV”) instead of vague placeholders like “[Company X]” or “[Player A].”
-2. **Leverage Real-World Context:** Incorporate current examples, industry trends, or case studies to make responses engaging and relevant. For time-sensitive queries (e.g., “latest headlines”), draw from real-time sources like web articles, X posts, or official updates, ensuring data aligns with the specified timeframe (e.g., last 24 hours).
+1. **Educate and Inspire:** Provide in-depth insights and practical advice that boost the user’s knowledge and confidence. Always use specific, named examples (e.g., “Nike’s $1.5B NFL deal” or “Arsenal’s 7-1 win over PSV” or “SponsorForce’s 2024 Partnership Guide”) instead of vague placeholders like “[Company X]” or “[Player A].”
+2. **Leverage Real-World Context:** Incorporate current examples, industry trends, or case studies from web articles, X posts, or sponsorforce.net data, ensuring relevance. For time-sensitive queries (e.g., “latest headlines”), filter to the specified timeframe (e.g., last 24 hours).
 3. **Provide Actionable Guidance:** Include clear, step-by-step instructions, best practices, or recommendations by default, unless a brief overview is requested. Ensure advice is practical and implementable.
-4. **Back Up with Data:** Support claims with credible data, statistics, or references (e.g., “Per Statista 2024, 65% of brands increased sponsorship budgets” or “X post by @FutballNews_, March 4, 2025”). Include timestamps for real-time sources and note the current date (e.g., March 5, 2025).
+4. **Back Up with Data:** Support claims with credible data, statistics, or references (e.g., “Per Statista 2024, 65% of brands increased sponsorship budgets” or “X post by @FutballNews_, March 4, 2025” or “SponsorForce API, March 5, 2025”). Include timestamps for real-time sources and note the current date (e.g., March 5, 2025).
 5. **Maintain a Professional Yet Approachable Tone:** Communicate authoritatively in an accessible, conversational style, avoiding jargon unless explained.
 
 **Response Structure:**
@@ -45,8 +45,9 @@ When crafting your response, adhere to these guidelines:
 
 **Additional Instructions:**
 - For time-sensitive queries, filter data to the exact timeframe (e.g., last 24 hours from March 4, 07:24 AM PST to March 5, 07:24 AM PST) and fetch real-time insights from X or the web via SearchAPI.
+- For sponsorforce.net queries, fetch data from `https://www.sponsorforce.net/sponsor/api/resource/queryResourceEs` and `https://www.sponsorforce.net/sponsor/api/article/query` via POST, index it, and prioritize it for relevant questions.
 - Prioritize current, verifiable information over hypothetical or outdated examples. If specifics are unavailable, estimate based on trends and flag assumptions (e.g., “Likely £40M based on 2024 market rates”).
-- Cite sources clearly (e.g., “Per @YohaigNG, March 4, 2025”) to build credibility.
+- Cite sources clearly (e.g., “Per @YohaigNG, March 4, 2025” or “SponsorForce API, March 5, 2025”) to build credibility.
 
 Ensure responses are well-formatted, specific, and leave the user with clear, actionable takeaways or solutions, regardless of the topic.
 """
@@ -62,6 +63,7 @@ class APIConfig(BaseModel):
     openai_key: str = os.getenv("OPENAI_API_KEY")
     searchapi_key: str = os.getenv("SEARCHAPI_KEY")
     x_bearer_token: str = os.getenv("X_BEARER_TOKEN")
+    sponsorforce_api_key: str = os.getenv("SPONSORFORCE_API_KEY")  # Add this for authentication if required
 
 app = FastAPI(title="SponsorForce AI Backend")
 config = APIConfig()
@@ -140,18 +142,48 @@ async def initialize_documents() -> VectorStoreIndex:
         print(f"❌ Document initialization failed: {e}")
         raise
 
+async def fetch_sponsorforce_data():
+    try:
+        headers = {"Authorization": f"Bearer {config.sponsorforce_api_key}"} if config.sponsorforce_api_key else {}
+        async with httpx.AsyncClient() as client:
+            resource_response = await client.post(
+                "https://www.sponsorforce.net/sponsor/api/resource/queryResourceEs",
+                headers=headers
+            )
+            article_response = await client.post(
+                "https://www.sponsorforce.net/sponsor/api/article/query",
+                headers=headers
+            )
+            resource_response.raise_for_status()
+            article_response.raise_for_status()
+            resource_data = resource_response.json()
+            article_data = article_response.json()
+
+            # Assume JSON responses contain text data (adjust based on actual API structure)
+            docs = []
+            for item in resource_data.get("results", []):
+                docs.append({"text": item.get("content", str(item)), "metadata": {"source": "SponsorForce Resource", "fetched_at": datetime.now().isoformat()}})
+            for item in article_data.get("results", []):
+                docs.append({"text": item.get("content", str(item)), "metadata": {"source": "SponsorForce Article", "fetched_at": datetime.now().isoformat()}})
+
+            embeddings = [embed_model.get_text_embedding(doc["text"]) for doc in docs]
+            astra_vector_store.add(embeddings, documents=[d["text"] for d in docs], metadatas=[d["metadata"] for d in docs])
+            global search_index
+            search_index = create_index_from_existing()
+            print("✅ SponsorForce data updated in vector store")
+    except Exception as e:
+        print(f"❌ SponsorForce data fetch failed: {e}")
+
 async def update_sports_data():
     try:
         web_reader = SimpleWebPageReader()
         sports_docs = await web_reader.load_data_async([
             "https://www.bbc.com/sport/football",
             "https://www.skysports.com/premier-league-news",
-            "https://www.nba.com/schedule"  # Added NBA source
+            "https://www.nba.com/schedule"
         ])
         embeddings = [embed_model.get_text_embedding(doc.text) for doc in sports_docs]
         astra_vector_store.add(embeddings, documents=[d.text for d in sports_docs], metadatas=[d.metadata for d in sports_docs])
-        global search_index
-        search_index = create_index_from_existing()
         print("✅ Sports data updated in vector store")
     except Exception as e:
         print(f"❌ Sports data update failed: {e}")
@@ -172,7 +204,8 @@ async def startup_event():
             search_index = create_index_from_existing()
         
         scheduler = AsyncIOScheduler()
-        scheduler.add_job(update_sports_data, "interval", hours=6)
+        scheduler.add_job(fetch_sponsorforce_data, "interval", hours=24)  # Update SponsorForce data daily
+        scheduler.add_job(update_sports_data, "interval", hours=6)  # Update sports data every 6 hours
         scheduler.start()
         print("✅ Background scheduler started")
     except Exception as e:
@@ -194,7 +227,6 @@ async def fetch_sports_data(query: str, timeframe: str = None) -> Dict:
             return {"error": str(e)}
 
 async def fetch_x_posts(query: str, timeframe_hours: int = 24) -> List[Dict]:
-    # Temporarily disabled due to X API limitations
     logging.info("X fetch disabled due to API access restrictions")
     return []
 
@@ -249,21 +281,33 @@ async def handle_query(request: QueryRequest):
         timeframe = "24h" if "last 24 hours" in query_lower else "48h" if "last 48 hours" in query_lower else None
         logging.info(f"Processing query: {request.query}, timeframe: {timeframe}")
 
-        # Broadened sports detection
+        # Broadened sports and sponsorforce detection
         sports_keywords = ["nba", "football", "premier league", "fixture", "match", "score", "standing", "result", "headlines", "schedule"]
+        sponsorforce_keywords = ["sponsorforce", "sponsorship", "article", "resource"]
         if any(keyword in query_lower for keyword in sports_keywords):
             logging.info("Fetching sports data via SearchAPI")
             sports_response = await fetch_sports_data(request.query, timeframe)
             if "error" not in sports_response and sports_response["response"]:
-                # Format SearchAPI results directly
                 formatted_response = f"### {request.query}\nAs of {datetime.now().strftime('%Y-%m-%d %H:%M PST')}:\n"
                 for result in sports_response["response"]:
                     formatted_response += f"- **{result['title']}**: {result['snippet']} ([Source]({result['link']}))\n"
-                formatted_response += "\n### Note\nThese results are sourced from recent web data. For exact times, check official schedules."
+                formatted_response += "\n### Note\nThese results are sourced from recent web data. For exact times or details, check official schedules."
                 logging.info(f"Sports data fetched and formatted: {formatted_response[:100]}...")
                 return {"response": formatted_response, "sources": [{"title": r["title"], "link": r["link"]} for r in sports_response["response"]]}
 
-        # Fallback to vector store with X context
+        elif any(keyword in query_lower for keyword in sponsorforce_keywords):
+            logging.info("Fetching SponsorForce data from vector store")
+            structured_query = f"{ROLE_AND_MISSION_PROMPT}\n\nCurrent date: {datetime.now().strftime('%Y-%m-%d %H:%M PST')}\nQuery: {request.query}"
+            query_engine = create_custom_query_engine(search_index, request.top_k, "tree_summarize")
+            response = await query_engine.aquery(structured_query)
+            formatted_response = format_response(response.response, request.query)
+            if "[Company X]" in formatted_response or "[Player A]" in formatted_response:
+                logging.info("Detected placeholders, performing deep search")
+                deep_response = await perform_deep_search(request.query, timeframe)
+                formatted_response += f"\n\n### Additional Insights\n{deep_response['response']}"
+            return {"response": formatted_response, "sources": [node.metadata for node in response.source_nodes]}
+
+        # Fallback to vector store with X context for non-specific queries
         structured_query = f"{ROLE_AND_MISSION_PROMPT}\n\nCurrent date: {datetime.now().strftime('%Y-%m-%d %H:%M PST')}\nQuery: {request.query}"
         if timeframe:
             structured_query += f"\nFilter to {timeframe} timeframe."
